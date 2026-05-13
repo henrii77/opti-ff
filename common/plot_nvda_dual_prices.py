@@ -67,7 +67,7 @@ def load_price_series(
     return times, prices
 
 
-def main() -> None:
+def plot_nvda_pair() -> None:
     parser = argparse.ArgumentParser(description="Plot NVDA vs NVDA_DUAL from strategy CSVs.")
     parser.add_argument(
         "--data-dir",
@@ -127,7 +127,3 @@ def main() -> None:
         print(f"Saved {args.save.resolve()}")
     else:
         plt.show()
-
-
-if __name__ == "__main__":
-    main()
