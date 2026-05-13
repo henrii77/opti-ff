@@ -1,28 +1,11 @@
 """
 Poll Optibook for strategy-oriented market snapshots across stocks, index ETFs, and index futures.
 
-**Universe:** After ``connect()``, instruments come from ``exchange.get_instruments()``. By default we
-keep ``InstrumentType.STOCK``, ``INDEX_TRACKING_ETF``, and ``INDEX_FUTURE``, and skip instruments
-that are paused or expired. Set ``INSTRUMENT_IDS`` to a non-empty list to restrict or debug without
-changing discovery logic.
-
-**CSV layout:** Each instrument is appended to its own file (see ``OUTPUT_FILENAME_TEMPLATE``). One row
-per poll per file; ``timestamp`` is shared across instruments within the same poll cycle so you can
-merge files on ``timestamp`` in pandas for pairs / stat arb.
-
-**Moving averages:** Use the ``mid`` column — volume-weighted touch price
-``(BidPrice*AskVolume + AskPrice*BidVolume) / (BidVolume + AskVolume)`` — with a consistent bar length
-set by ``POLL_INTERVAL``.
-
-**Market making:** Touch ``bid_price`` / ``ask_price``, sizes, and ``spread`` (quoted spread).
-
-**Statistical arbitrage / pairs:** Pair spreads are not duplicated as extra columns. Filter two
-``instrument_id`` values (or the same ``instrument_group`` for dual listings), align on ``timestamp``,
-then compute e.g. ``mid_A - mid_B`` or log-mid differences in pandas.
+CSV output defaults to this package directory (``data/``). Override with ``run_collector(..., output_dir=...)``.
 
 **Run from repo root:**
 
-    PYTHONPATH=. python common/collect_strategy_data.py
+    PYTHONPATH=. python data/collect_strategy_data.py
 """
 
 from __future__ import annotations
@@ -35,9 +18,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Un
 from optibook.common_types import InstrumentType
 from optibook.synchronous_client import Exchange
 
+_DATA_DIR = Path(__file__).resolve().parent
+
 # --- CONFIGURATION ---
 POLL_INTERVAL = 1.0  # seconds between poll cycles (defines bar spacing for offline MAs)
-OUTPUT_DIR = Path(".")
+OUTPUT_DIR = _DATA_DIR
 # Per-instrument files: one CSV per symbol (ETFs/futures use the same naming pattern).
 OUTPUT_FILENAME_TEMPLATE = "{instrument_id}_strategy_market_data.csv"
 
