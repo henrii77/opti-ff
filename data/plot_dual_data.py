@@ -1,5 +1,7 @@
 """
-Plot NVDA vs NVDA_DUAL from the fixed strategy CSVs in ``data/``.
+Plot NVDA vs NVDA_DUAL from fixed strategy CSV paths under ``data/``.
+
+Notebooks (cwd may be ``optibook_guides/``; add repo root to ``sys.path`` first)::
 
     from data.plot_dual_data import plot_nvda_dual_data
     plot_nvda_dual_data()
@@ -10,24 +12,26 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Union
 
+from data.plot_dual_prices import load_price_series
+
 _DATA_DIR = Path(__file__).resolve().parent
-NVDA_CSV = _DATA_DIR / "NVDA_strategy_market_data.csv"
-NVDA_DUAL_CSV = _DATA_DIR / "NVDA_DUAL_strategy_market_data.csv"
+NVDA_STRATEGY_CSV = _DATA_DIR / "NVDA_strategy_market_data.csv"
+NVDA_DUAL_STRATEGY_CSV = _DATA_DIR / "NVDA_DUAL_strategy_market_data.csv"
 
 
 def plot_nvda_dual_data(save: Optional[Union[str, Path]] = None) -> None:
-    """Plot NVDA and NVDA_DUAL mid/price series from the bundled strategy market CSVs."""
-    try:
-        from data.plot_dual_prices import load_price_series
-    except ModuleNotFoundError:
-        from plot_dual_prices import load_price_series
+    """
+    Plot mid/microprice series from the NVDA and NVDA_DUAL strategy market CSVs.
+    """
+    path_left = NVDA_STRATEGY_CSV
+    path_right = NVDA_DUAL_STRATEGY_CSV
 
-    t1, p1 = load_price_series(NVDA_CSV)
-    t2, p2 = load_price_series(NVDA_DUAL_CSV)
+    t1, p1 = load_price_series(path_left)
+    t2, p2 = load_price_series(path_right)
 
     try:
-        import matplotlib.dates as mdates
         import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
     except ImportError as e:
         raise SystemExit(
             "matplotlib is required. Install with: pip install matplotlib"
@@ -38,11 +42,11 @@ def plot_nvda_dual_data(save: Optional[Union[str, Path]] = None) -> None:
     if t1:
         ax.plot(t1, p1, label=left_id, linewidth=1.2)
     else:
-        print(f"Warning: no plottable rows in {NVDA_CSV}")
+        print(f"Warning: no plottable rows in {path_left}")
     if t2:
         ax.plot(t2, p2, label=right_id, linewidth=1.2)
     else:
-        print(f"Warning: no plottable rows in {NVDA_DUAL_CSV}")
+        print(f"Warning: no plottable rows in {path_right}")
 
     ax.set_xlabel("Time (UTC)")
     ax.set_ylabel("Price (mid / microprice / mid of bid-ask / last trade)")
@@ -59,3 +63,10 @@ def plot_nvda_dual_data(save: Optional[Union[str, Path]] = None) -> None:
         print(f"Saved {out.resolve()}")
     else:
         plt.show()
+
+
+__all__ = [
+    "NVDA_DUAL_STRATEGY_CSV",
+    "NVDA_STRATEGY_CSV",
+    "plot_nvda_dual_data",
+]
