@@ -1,10 +1,11 @@
 """
-Plot dual-listed pairs (base vs *_DUAL) using **mid** prices from fixed strategy CSVs.
+Plot both dual-listed pairs (NVDA/NVDA_DUAL and NVO/NVO_DUAL) from **mid** prices
+in fixed strategy CSVs under ``data/``.
 
 Notebooks (cwd may be ``optibook_guides/``; add repo root to ``sys.path`` first)::
 
-    from data.plot_dual_data import plot_dual_pairs_mid, plot_nvda_dual_data
-    plot_dual_pairs_mid()
+    from data.plot_dual_data import plot_dual_pairs
+    plot_dual_pairs()
 """
 
 from __future__ import annotations
@@ -47,31 +48,9 @@ def _plot_mid_pair_on_ax(
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S\n%m-%d"))
 
 
-def plot_nvda_dual_data(save: Optional[Union[str, Path]] = None) -> None:
-    """Plot NVDA and NVDA_DUAL **mid** series from the hard-coded strategy CSVs."""
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError as e:
-        raise SystemExit(
-            "matplotlib is required. Install with: pip install matplotlib"
-        ) from e
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    _plot_mid_pair_on_ax(ax, NVDA_STRATEGY_CSV, NVDA_DUAL_STRATEGY_CSV, "NVDA", "NVDA_DUAL")
-    ax.set_xlabel("Time (UTC)")
-    fig.autofmt_xdate()
-    plt.tight_layout()
-    if save:
-        out = Path(save)
-        fig.savefig(out, dpi=150)
-        print(f"Saved {out.resolve()}")
-    else:
-        plt.show()
-
-
-def plot_dual_pairs_mid(save: Optional[Union[str, Path]] = None) -> None:
+def plot_dual_pairs(save: Optional[Union[str, Path]] = None) -> None:
     """
-    Plot **mid** prices for both dual-listed pairs: NVDA/NVDA_DUAL and NVO/NVO_DUAL.
+    Plot **mid** prices from CSV for NVDA/NVDA_DUAL (top) and NVO/NVO_DUAL (bottom).
     """
     try:
         import matplotlib.pyplot as plt
@@ -99,6 +78,5 @@ __all__ = [
     "NVDA_STRATEGY_CSV",
     "NVO_DUAL_STRATEGY_CSV",
     "NVO_STRATEGY_CSV",
-    "plot_dual_pairs_mid",
-    "plot_nvda_dual_data",
+    "plot_dual_pairs",
 ]
