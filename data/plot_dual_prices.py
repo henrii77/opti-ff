@@ -137,6 +137,34 @@ def load_price_series(path: Path) -> Tuple[List[datetime], List[float]]:
     return times, prices
 
 
+def load_mid_series(path: Path) -> Tuple[List[datetime], List[float]]:
+    """Like ``load_price_series`` but only uses the ``mid`` column (rows without mid are skipped)."""
+    times: List[datetime] = []
+    prices: List[float] = []
+    if not path.is_file():
+        return times, prices
+
+    with path.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return times, prices
+        for raw in reader:
+            row = _strip_row(raw)
+            ts_raw = row.get("timestamp", "")
+            if not ts_raw:
+                continue
+            try:
+                ts = float(ts_raw)
+            except ValueError:
+                continue
+            mid = _parse_float(row.get("mid", ""))
+            if mid is None:
+                continue
+            times.append(datetime.fromtimestamp(ts, tz=timezone.utc))
+            prices.append(mid)
+    return times, prices
+
+
 def plot_nvda_pair(
     data_dir: Optional[Union[str, Path]] = None,
     template: Optional[str] = None,
