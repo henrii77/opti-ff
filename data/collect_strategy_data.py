@@ -3,6 +3,8 @@ Poll Optibook for strategy-oriented market snapshots across stocks, index ETFs, 
 
 CSV output defaults to ``data/csv/`` under this package. Override with ``run_collector(..., output_dir=...)``.
 
+Optibook allows **only one active session per account**. If another script, notebook, or machine connects with the same credentials, this process will be disconnected and the collector exits cleanly instead of crashing.
+
 **Run from repo root:**
 
     PYTHONPATH=. python data/collect_strategy_data.py
@@ -214,13 +216,30 @@ def run_collector(
         f"({filename_template!r}) every {poll_interval}s. Ctrl+C to stop."
     )
 
+    disconnect_msg = (
+        "\n[collect_strategy_data] Disconnected from Optibook — stopping.\n"
+        "  Common cause: another client logged in with the same credentials "
+        "(only one live session is allowed). Close the other session and restart this script.\n"
+    )
+
     try:
         while True:
+            if not exchange.is_connected():
+                print(disconnect_msg)
+                return
+
             loop_start = time.time()
             ts = time.time()
             for (inst_id, inst), path in zip(universe, paths):
+                try:
+                    row = snapshot_row(ts, inst_id, inst, exchange)
+                except AssertionError:
+                    if not exchange.is_connected():
+                        print(disconnect_msg)
+                        return
+                    raise
                 with open(path, "a", newline="") as f:
-                    csv.writer(f).writerow(snapshot_row(ts, inst_id, inst, exchange))
+                    csv.writer(f).writerow(row)
 
             elapsed = time.time() - loop_start
             if elapsed < poll_interval:
