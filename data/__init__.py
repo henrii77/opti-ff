@@ -1,1 +1,1 @@
-"""Optibook CSV collectors and plotting live in this package."""
+"""Optibook CSV collectors and plotting; strategy CSVs live in ``data/csv/``."""
