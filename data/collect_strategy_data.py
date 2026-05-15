@@ -136,12 +136,23 @@ def snapshot_row(
     exchange: Exchange,
 ) -> List[Any]:
     """One CSV row for this instrument at timestamp ts."""
+    book = exchange.get_last_price_book(instrument_id)
+    return snapshot_row_with_book(ts, instrument_id, inst, exchange, book)
+
+
+def snapshot_row_with_book(
+    ts: float,
+    instrument_id: str,
+    inst: Optional[Any],
+    exchange: Exchange,
+    book: Any,
+) -> List[Any]:
+    """Same row shape as :func:`snapshot_row`, but uses a pre-fetched price book."""
     if inst is not None:
         type_name, group_s, idx_s = _meta_for_instrument(inst)
     else:
         type_name, group_s, idx_s = "", "", ""
 
-    book = exchange.get_last_price_book(instrument_id)
     ticks = exchange.get_trade_tick_history(instrument_id)
     last_trade = ticks[-1].price if ticks else None
 

@@ -23,6 +23,9 @@ from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
+
+from data.collect_strategy_data import HEADER, snapshot_row_with_book
 
 # Optional live client (notebook / tests can import Trader without Optibook)
 try:
@@ -90,6 +93,8 @@ class Trader:
     OLS_WINDOW = 60
     OLS_CORR_MIN = 0.50
 
+    TICK_HISTORY_MAX_ROWS = 10_000
+
     def __init__(self) -> None:
         self._action_ts: Deque[float] = deque()
         self._start_time = 0.0
@@ -99,6 +104,8 @@ class Trader:
         self._history: Dict[str, Deque[float]] = {}
         self._vol_state: Dict[str, float] = {}
         self._all_assets: List[str] = []
+        self._instrument_meta: Dict[str, Any] = {}
+        self._tick_frames: Dict[str, pd.DataFrame] = {}
         self._ols_params: Dict[Tuple[str, str], Dict[str, Any]] = {
             pair: {"beta": 1.0, "alpha": 0.0, "ready": False} for pair in self.STAT_PAIRS
         }
@@ -182,6 +189,13 @@ class Trader:
 
         return result if result else self.FALLBACK_EXPIRIES.copy()
 
+    @staticmethod
+    def _resolve_instrument(instruments: Dict[Any, Any], aid: str) -> Any:
+        for k, v in instruments.items():
+            if str(k) == str(aid):
+                return v
+        return None
+
     def _bootstrap(self, exchange: Any) -> None:
         print("=" * 60)
         print("  OMNI-ENGINE V4  —  Starting up")
@@ -208,6 +222,13 @@ class Trader:
         }
         self._loop_count = 0
 
+        instruments = exchange.get_instruments()
+        self._instrument_meta = {
+            aid: self._resolve_instrument(instruments, aid) for aid in self._all_assets
+        }
+        cols = list(HEADER)
+        self._tick_frames = {aid: pd.DataFrame(columns=cols) for aid in self._all_assets}
+
     def _recalc(self, exchange: Any) -> None:
         self._futures_expiries = self.discover_futures(exchange)
         for f in self._futures_expiries:
@@ -215,6 +236,10 @@ class Trader:
                 self._history[f] = deque(maxlen=self.VOL_LOOKBACK)
                 if f not in self._all_assets:
                     self._all_assets.append(f)
+            if f not in self._tick_frames:
+                ins = exchange.get_instruments()
+                self._instrument_meta[f] = self._resolve_instrument(ins, f)
+                self._tick_frames[f] = pd.DataFrame(columns=list(HEADER))
 
         win = self.OLS_WINDOW
         for s1, s2 in self.STAT_PAIRS:
@@ -294,6 +319,39 @@ class Trader:
         self._strategy_futures_calendar(books, mids_snap, virt_pos, exchange, X_t)
         self._strategy_stat_arb(books, mids_snap, virt_pos, exchange, elapsed)
         self._strategy_emergency_shed(books, positions, exchange)
+        self.poll_tick_history(exchange, now, books)
+
+    def poll_tick_history(self, exchange: Any, ts: float, books: Dict[str, Any]) -> None:
+        """
+        Append one CSV-shaped row per instrument (same columns as ``collect_strategy_data``).
+
+        Uses the books already fetched this tick (no duplicate ``get_last_price_book``).
+        Each :class:`pandas.DataFrame` retains at most :attr:`TICK_HISTORY_MAX_ROWS` rows,
+        dropping the oldest row when full before appending the new one.
+        """
+        if not exchange.is_connected():
+            return
+        cols = list(HEADER)
+        for inst_id in self._all_assets:
+            book = books.get(inst_id)
+            if not book:
+                continue
+            inst = self._instrument_meta.get(inst_id)
+            try:
+                row = snapshot_row_with_book(ts, inst_id, inst, exchange, book)
+            except AssertionError:
+                if not exchange.is_connected():
+                    return
+                raise
+            df = self._tick_frames.setdefault(inst_id, pd.DataFrame(columns=cols))
+            df.loc[len(df)] = row
+            if len(df) > self.TICK_HISTORY_MAX_ROWS:
+                self._tick_frames[inst_id] = df.iloc[1:].reset_index(drop=True)
+
+    @property
+    def tick_frames(self) -> Dict[str, pd.DataFrame]:
+        """Mapping ``instrument_id`` → rolling tick history (CSV column layout)."""
+        return self._tick_frames
 
     # --- Strategies ---------------------------------------------------------
 
