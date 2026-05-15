@@ -724,15 +724,7 @@ class Trader:
     def start(self, exchange: Any) -> None:
         self._bootstrap(exchange)
 
-    def run(
-        self,
-        exchange: Any,
-        *,
-        quote_diff: Optional[float] = None,
-        increment: Optional[float] = None,
-        cancel_after_market_trades: Optional[int] = None,
-        quote_volume: Optional[int] = None,
-    ) -> None:
+    def run(self, exchange: Any, *args: Any, **kwargs: Any) -> None:
         """
         Blocking quote loop. Override tuning without reconstructing ``Trader``::
 
@@ -743,7 +735,41 @@ class Trader:
                 cancel_after_market_trades=50,
                 quote_volume=10,
             )
+
+        Also accepts up to four optional positionals after ``exchange`` in order:
+        ``quote_diff``, ``increment``, ``cancel_after_market_trades``, ``quote_volume``.
+        ``quote_increment`` is accepted as an alias for ``increment`` (same as ``__init__``).
         """
+        keys = ("quote_diff", "increment", "cancel_after_market_trades", "quote_volume")
+        if len(args) > len(keys):
+            raise TypeError(
+                f"Trader.run() takes at most {len(keys)} optional positional argument(s) "
+                f"after exchange (got {len(args)})"
+            )
+        for i, val in enumerate(args):
+            k = keys[i]
+            if k in kwargs:
+                raise TypeError(f"Trader.run() got multiple values for argument {k!r}")
+            kwargs[k] = val
+
+        if "quote_increment" in kwargs:
+            if kwargs.get("increment", None) is not None:
+                raise TypeError("Trader.run() got both increment and quote_increment")
+            kwargs["increment"] = kwargs.pop("quote_increment")
+
+        quote_diff = kwargs.pop("quote_diff", None)
+        increment = kwargs.pop("increment", None)
+        cancel_after_market_trades = kwargs.pop("cancel_after_market_trades", None)
+        quote_volume = kwargs.pop("quote_volume", None)
+
+        if kwargs:
+            bad = ", ".join(sorted(kwargs))
+            raise TypeError(
+                f"Trader.run() got unexpected keyword argument(s): {bad}. "
+                "Supported: quote_diff, increment, quote_increment, "
+                "cancel_after_market_trades, quote_volume."
+            )
+
         if quote_diff is not None:
             self._quote_diff = float(quote_diff)
         if increment is not None:
