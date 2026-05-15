@@ -10,7 +10,8 @@ anchored to the **MAIN** mid (e.g. NVDA_DUAL bid/ask around NVDA).
   the dual with **no** fill are cancelled.
 
 Live loop: :meth:`Trader.run` (blocking). For a single tick: :meth:`Trader.step`
-(:meth:`Trader.step` enforces at most :data:`Trader.MAX_UPDATES_PER_SEC` calls per wall-clock second).
+(throttled to :data:`Trader.MAX_STEP_CALLS_PER_SEC` / s; exchange inserts / cancels / amends are capped
+by :data:`Trader.MAX_EXCHANGE_OPS_PER_SEC` / s via :meth:`Trader.can_trade`).
 
 Offline replay helper: :meth:`Trader.replay_dual_listing` (rolling z on spread; unchanged API).
 """
@@ -77,9 +78,11 @@ class Trader:
     TICK_SIZE = 0.10
     MAX_POSITION = 99
     SAFE_POSITION = 80
-    # Cap strategy loop / step() rate and trailing-1s exchange action budget.
-    MAX_UPDATES_PER_SEC = 23
-    RATE_LIMIT = MAX_UPDATES_PER_SEC
+    # Inserts, cancels, and amends (trailing 1s window via can_trade / log_actions).
+    MAX_EXCHANGE_OPS_PER_SEC = 25
+    RATE_LIMIT = MAX_EXCHANGE_OPS_PER_SEC
+    # Main-loop / notebook :meth:`step` call rate (wall-clock).
+    MAX_STEP_CALLS_PER_SEC = 25
     DEFAULT_QUOTE_VOLUME = 10
 
     TICK_HISTORY_MAX_ROWS = 10_000
@@ -116,7 +119,7 @@ class Trader:
         self._next_step_perf: float = -1.0
 
     def _throttle_step_rate(self) -> None:
-        period = 1.0 / float(type(self).MAX_UPDATES_PER_SEC)
+        period = 1.0 / float(type(self).MAX_STEP_CALLS_PER_SEC)
         now = time.perf_counter()
         if self._next_step_perf >= 0.0:
             wait = self._next_step_perf - now
@@ -135,6 +138,7 @@ class Trader:
         return round(round(price / Trader.TICK_SIZE) * Trader.TICK_SIZE, 10)
 
     def can_trade(self, n: int = 1) -> bool:
+        """Whether ``n`` more exchange ops (insert / cancel / amend) fit in the trailing 1s window."""
         now = time.time()
         while self._action_ts and now - self._action_ts[0] > 1.0:
             self._action_ts.popleft()
