@@ -1,27 +1,26 @@
 """
-Dual-listing mean reversion: rolling z-score on (MAIN_mid − DUAL_mid).
+Dual-listing market making on the **DUAL** line only: resting **limit** orders
+anchored to the **MAIN** mid (e.g. NVDA_DUAL bid/ask around NVDA).
 
-Live: only NVDA / NVDA_DUAL and NVO / NVO_DUAL. Symmetric entry when
-``z >= z_threshold_*`` (short spread) or ``z <= -z_threshold_*`` (long spread),
-with optional flat-z partial exits.
+- Initial quotes: ``bid_dual = main_mid - quote_diff``, ``ask_dual = main_mid + quote_diff``
+  (prices rounded to :data:`Trader.TICK_SIZE`).
+- After our **ask** on the dual is lifted (filled / size drops), both targets move up by
+  ``increment``, clamped so ``bid_dual <= main_mid`` and ``ask_dual >= main_mid``.
+- Resting dual orders that see ``cancel_after_market_trades`` **public** trade ticks on
+  the dual with **no** fill are cancelled.
 
-Offline: :meth:`Trader.replay_dual_listing` for aligned mid arrays (rolling z, no sklearn).
+Live loop: :meth:`Trader.run` (blocking). For a single tick: :meth:`Trader.step`.
 
-Tick history: same CSV-shaped :class:`pandas.DataFrame` rows as ``collect_strategy_data``.
-On :meth:`start`, optional **CSV warm-start** loads recent rows from
-``{instrument_id}_strategy_market_data.csv`` under ``csv_dir`` (same layout as the collector)
-into ``tick_frames`` and seeds rolling spread deques from aligned mids.
-
-Live loop: :meth:`Trader.run` (blocking). To interleave with another coroutine (e.g.
-``collector_poll_once`` in a notebook), call :meth:`Trader.start` once then :meth:`Trader.step` each cycle.
+Offline replay helper: :meth:`Trader.replay_dual_listing` (rolling z on spread; unchanged API).
 """
 
 from __future__ import annotations
 
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Union
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -39,8 +38,32 @@ except ImportError:  # pragma: no cover
     Exchange = Any  # type: ignore[misc, assignment]
 
 
+# Used only by :meth:`Trader.replay_dual_listing` (notebook / offline).
+Z_SCORE_WINDOW = 50
+Z_STD_EPS = 1e-9
+Z_ROLLING_STD_FLOOR = 0.22
+
+
+@dataclass
+class _RestingSide:
+    order_id: Optional[Any] = None
+    placed_trade_seq: int = 0
+    initial_volume: int = 0
+
+
+@dataclass
+class _DualQuoteState:
+    """Per-(main,dual) pair: track lift skew and resting dual orders."""
+
+    lift_steps: int = 0
+    market_trade_seq: int = 0
+    bid: _RestingSide = field(default_factory=_RestingSide)
+    ask: _RestingSide = field(default_factory=_RestingSide)
+    prev_ask_outstanding_vol: Optional[int] = None
+
+
 class Trader:
-    """Dual-listing IOC trader using rolling spread z-scores."""
+    """Dual-listing **limit** quoter on DUAL anchored to MAIN mid."""
 
     DUAL_PAIRS = [
         ("NVDA", "NVDA_DUAL"),
@@ -52,43 +75,28 @@ class Trader:
     SAFE_POSITION = 80
     LOOP_SLEEP = 0.04
     RATE_LIMIT = 21
-    BASE_VOLUME = 10
-
-    Z_SCORE_WINDOW = 50
-    Z_STD_EPS = 1e-9
-    Z_EXIT = 0.3
-    # Risk: max(|main|, |dual|) — above this we only shrink inventory (ignore z entries).
-    POSITION_EMERGENCY_CLEAR = 55
-    CLEAR_CHUNK_LARGE = 28
-    # Do not open new spread trades if either leg already this large (prevents pyramiding).
-    SKIP_NEW_ENTRY_GROSS = 42
-    # Treat pair as already "in" a long-spread / short-spread trade if legs exceed this hedge band.
-    PAIR_HEDGE_EPS = 4
-    # |pos_main + pos_dual| should be ~0 if both legs filled equally; above this, repair main first.
-    HEDGE_IMBALANCE_MAX = 10
-    HEDGE_REPAIR_CHUNK = 12
-    # Scale size by |z|/z_thr, capped (so huge z does not single-tick max the book).
-    Z_VOL_MULT_MAX = 3.0
+    DEFAULT_QUOTE_VOLUME = 10
 
     TICK_HISTORY_MAX_ROWS = 10_000
 
     @staticmethod
     def default_csv_dir() -> Path:
-        """Default directory for ``*_strategy_market_data.csv`` (repo ``data/csv``)."""
         return Path(__file__).resolve().parent / "data" / "csv"
 
     def __init__(
         self,
-        z_threshold_nvda: float = 2.0,
-        z_threshold_nvo: float = 2.0,
         *,
-        z_window: int = Z_SCORE_WINDOW,
+        quote_diff: float = 0.50,
+        quote_increment: float = 0.10,
+        cancel_after_market_trades: int = 50,
+        quote_volume: int = 10,
         csv_dir: Optional[Union[str, Path]] = None,
-        csv_warm_start: bool = True,
+        csv_warm_start: bool = False,
     ) -> None:
-        self._z_threshold_nvda = float(z_threshold_nvda)
-        self._z_threshold_nvo = float(z_threshold_nvo)
-        self._z_window = int(z_window)
+        self._quote_diff = float(quote_diff)
+        self._quote_increment = float(quote_increment)
+        self._cancel_after_market_trades = int(cancel_after_market_trades)
+        self._quote_volume = int(quote_volume)
         self._csv_dir = Path(csv_dir) if csv_dir is not None else self.default_csv_dir()
         self._csv_warm_start = bool(csv_warm_start)
 
@@ -98,18 +106,14 @@ class Trader:
         self._all_assets: List[str] = []
         self._instrument_meta: Dict[str, Any] = {}
         self._tick_frames: Dict[str, pd.DataFrame] = {}
-        self._spread_hist: Dict[str, Deque[float]] = {}
         self._loop_count = 0
+        self._pair_states: Dict[str, _DualQuoteState] = {}
 
-    def _pair_key(self, main: str, dual: str) -> str:
-        return f"{main}_{dual}_spread"
-
-    def _z_threshold_for_main(self, main: str) -> float:
-        if main == "NVDA":
-            return self._z_threshold_nvda
-        if main == "NVO":
-            return self._z_threshold_nvo
-        return max(self._z_threshold_nvda, self._z_threshold_nvo)
+    def _state_for(self, main: str, dual: str) -> _DualQuoteState:
+        key = f"{main}|{dual}"
+        if key not in self._pair_states:
+            self._pair_states[key] = _DualQuoteState()
+        return self._pair_states[key]
 
     @staticmethod
     def round_tick(price: float) -> float:
@@ -139,156 +143,6 @@ class Trader:
             return max(0, min(requested, cap - pos))
         return max(0, min(requested, cap + pos))
 
-    def _scaled_spread_volume(self, z: float, z_thr: float) -> int:
-        """Larger |z| vs threshold → larger clip (IOC), capped."""
-        mag = abs(z) / max(float(z_thr), 1e-9)
-        mult = min(self.Z_VOL_MULT_MAX, max(1.0, mag))
-        raw = int(round(self.BASE_VOLUME * mult))
-        return max(1, min(raw, 28))
-
-    def _emergency_reduce_pair(
-        self,
-        main: str,
-        dual: str,
-        bk_m: Any,
-        bk_d: Any,
-        virt_pos: Dict[str, int],
-        exchange: Any,
-    ) -> bool:
-        """Shrink large legs toward flat. Returns True if any order sent."""
-        pos_m = virt_pos.get(main, 0)
-        pos_d = virt_pos.get(dual, 0)
-        ch = self.CLEAR_CHUNK_LARGE
-        sent = False
-
-        def leg_main() -> None:
-            nonlocal sent, pos_m
-            if pos_m > 0 and bk_m.bids and self.can_trade(1):
-                v = min(ch, pos_m, self.safe_vol(pos_m, ch, "ask"))
-                if v > 0:
-                    exchange.insert_order(
-                        main, price=bk_m.bids[0].price, volume=v, side="ask", order_type="ioc"
-                    )
-                    self.log_actions(1)
-                    virt_pos[main] = pos_m - v
-                    sent = True
-            elif pos_m < 0 and bk_m.asks and self.can_trade(1):
-                v = min(ch, abs(pos_m), self.safe_vol(pos_m, ch, "bid"))
-                if v > 0:
-                    exchange.insert_order(
-                        main, price=bk_m.asks[0].price, volume=v, side="bid", order_type="ioc"
-                    )
-                    self.log_actions(1)
-                    virt_pos[main] = pos_m + v
-                    sent = True
-
-        def leg_dual() -> None:
-            nonlocal sent, pos_d
-            if pos_d > 0 and bk_d.bids and self.can_trade(1):
-                v = min(ch, pos_d, self.safe_vol(pos_d, ch, "ask"))
-                if v > 0:
-                    exchange.insert_order(
-                        dual, price=bk_d.bids[0].price, volume=v, side="ask", order_type="ioc"
-                    )
-                    self.log_actions(1)
-                    virt_pos[dual] = pos_d - v
-                    sent = True
-            elif pos_d < 0 and bk_d.asks and self.can_trade(1):
-                v = min(ch, abs(pos_d), self.safe_vol(pos_d, ch, "bid"))
-                if v > 0:
-                    exchange.insert_order(
-                        dual, price=bk_d.asks[0].price, volume=v, side="bid", order_type="ioc"
-                    )
-                    self.log_actions(1)
-                    virt_pos[dual] = pos_d + v
-                    sent = True
-
-        if abs(pos_m) >= abs(pos_d):
-            leg_main()
-            pos_m = virt_pos.get(main, 0)
-            pos_d = virt_pos.get(dual, 0)
-            leg_dual()
-        else:
-            leg_dual()
-            pos_m = virt_pos.get(main, 0)
-            pos_d = virt_pos.get(dual, 0)
-            leg_main()
-        return sent
-
-    def _repair_hedge_imbalance(
-        self,
-        main: str,
-        dual: str,
-        bk_m: Any,
-        bk_d: Any,
-        virt_pos: Dict[str, int],
-        exchange: Any,
-        hedge_err: int,
-    ) -> bool:
-        """
-        pos_main + pos_dual should be ~0 for a balanced dual arb.
-        Positive hedge_err → net long risk on the pair expression — trim main (sell if long).
-        Negative → buy back main if short.
-        """
-        ch = self.HEDGE_REPAIR_CHUNK
-        pos_m = virt_pos.get(main, 0)
-        if hedge_err > 0 and pos_m > 0 and bk_m.bids and self.can_trade(1):
-            v = min(ch, hedge_err, pos_m, self.safe_vol(pos_m, ch, "ask"))
-            if v > 0:
-                exchange.insert_order(
-                    main, price=bk_m.bids[0].price, volume=v, side="ask", order_type="ioc"
-                )
-                self.log_actions(1)
-                virt_pos[main] = pos_m - v
-                return True
-        if hedge_err < 0 and pos_m < 0 and bk_m.asks and self.can_trade(1):
-            v = min(ch, abs(hedge_err), abs(pos_m), self.safe_vol(pos_m, ch, "bid"))
-            if v > 0:
-                exchange.insert_order(
-                    main, price=bk_m.asks[0].price, volume=v, side="bid", order_type="ioc"
-                )
-                self.log_actions(1)
-                virt_pos[main] = pos_m + v
-                return True
-        return False
-
-    @staticmethod
-    def _order_ack_ok(resp: Any) -> bool:
-        """
-        Best-effort: True if ``insert_order`` looks successful (fill or acceptance).
-
-        Optibook returns a small response object; attribute names vary by version.
-        Prefer explicit fill volume when present; otherwise ``success`` or ``order_id``.
-        """
-        if resp is None:
-            return False
-        if getattr(resp, "success", None) is False:
-            return False
-        for attr in (
-            "filled_volume",
-            "traded_volume",
-            "executed_volume",
-            "volume_executed",
-            "filled",
-        ):
-            if hasattr(resp, attr):
-                raw = getattr(resp, attr)
-                if raw is None:
-                    continue
-                try:
-                    fv = float(raw)
-                except (TypeError, ValueError):
-                    continue
-                if fv > 0:
-                    return True
-                return False
-        if getattr(resp, "success", None) is True:
-            return True
-        oid = getattr(resp, "order_id", None)
-        if oid is not None and oid != "" and oid != 0:
-            return True
-        return False
-
     @staticmethod
     def mid(book: Any) -> Optional[float]:
         if book and book.bids and book.asks:
@@ -302,19 +156,231 @@ class Trader:
                 return v
         return None
 
+    @staticmethod
+    def _order_id_from_insert(resp: Any) -> Optional[Any]:
+        if resp is None:
+            return None
+        if getattr(resp, "success", None) is False:
+            return None
+        oid = getattr(resp, "order_id", None)
+        if oid is not None and oid != "" and oid != 0:
+            return oid
+        return None
+
+    @staticmethod
+    def _poll_trade_tick_len(exchange: Any, dual: str) -> int:
+        try:
+            ticks = exchange.poll_new_trade_ticks(dual)
+        except Exception:
+            return 0
+        if ticks is None:
+            return 0
+        try:
+            return len(ticks)
+        except TypeError:
+            return 0
+
+    def _outstanding_orders(self, exchange: Any, dual: str) -> List[Any]:
+        try:
+            oo = exchange.get_outstanding_orders(dual)
+        except Exception:
+            return []
+        if oo is None:
+            return []
+        return list(oo)
+
+    def _volume_for_order_id(self, exchange: Any, dual: str, order_id: Any) -> Optional[int]:
+        for o in self._outstanding_orders(exchange, dual):
+            oid = getattr(o, "order_id", None)
+            if oid is None and o is not None:
+                oid = getattr(o, "id", None)
+            if oid == order_id:
+                v = getattr(o, "volume", None)
+                if v is not None:
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        pass
+        return None
+
+    def _cancel_order_safe(self, exchange: Any, dual: str, order_id: Any) -> None:
+        if order_id is None:
+            return
+        try:
+            exchange.delete_order(dual, order_id=order_id)
+            self.log_actions(1)
+        except Exception:
+            pass
+
+    def _intended_dual_prices(self, main_mid: float, st: _DualQuoteState) -> Tuple[float, float]:
+        ref = self.round_tick(main_mid)
+        qd = self._quote_diff
+        inc = self._quote_increment
+        k = st.lift_steps
+        raw_bid = ref - qd + k * inc
+        raw_ask = ref + qd + k * inc
+        bid_px = min(self.round_tick(raw_bid), ref)
+        ask_px = max(self.round_tick(raw_ask), ref)
+        if bid_px >= ask_px:
+            bid_px = self.round_tick(ref - self.TICK_SIZE)
+            ask_px = self.round_tick(ref + self.TICK_SIZE)
+        return bid_px, ask_px
+
+    def _maybe_cancel_stale_resting(
+        self,
+        exchange: Any,
+        dual: str,
+        st: _DualQuoteState,
+        side: _RestingSide,
+        side_name: str,
+    ) -> None:
+        if side.order_id is None:
+            return
+        if st.market_trade_seq - side.placed_trade_seq < self._cancel_after_market_trades:
+            return
+        rem = self._volume_for_order_id(exchange, dual, side.order_id)
+        if rem is None:
+            # Order gone (filled/cancelled elsewhere) — clear handle
+            side.order_id = None
+            return
+        if rem < side.initial_volume:
+            return
+        if not self.can_trade(1):
+            return
+        self._cancel_order_safe(exchange, dual, side.order_id)
+        side.order_id = None
+        side.initial_volume = 0
+        print(
+            f"  [DUAL MM STALE {side_name.upper()}] {dual}  "
+            f"cancel after {self._cancel_after_market_trades} mkt ticks w/o fill"
+        )
+
+    def _ensure_limit(
+        self,
+        exchange: Any,
+        dual: str,
+        pos_d: int,
+        side_name: str,
+        side: str,
+        target_px: float,
+        st_side: _RestingSide,
+        st: _DualQuoteState,
+    ) -> None:
+        vol_req = self.safe_vol(pos_d, self._quote_volume, "bid" if side == "bid" else "ask")
+        if vol_req <= 0:
+            if st_side.order_id is not None and self.can_trade(1):
+                self._cancel_order_safe(exchange, dual, st_side.order_id)
+                st_side.order_id = None
+            return
+
+        target_px = self.round_tick(target_px)
+        eps = self.TICK_SIZE / 4
+
+        if st_side.order_id is not None:
+            rem = self._volume_for_order_id(exchange, dual, st_side.order_id)
+            if rem is None or rem <= 0:
+                st_side.order_id = None
+            else:
+                cur_px: Optional[float] = None
+                for o in self._outstanding_orders(exchange, dual):
+                    oid = getattr(o, "order_id", getattr(o, "id", None))
+                    if oid != st_side.order_id:
+                        continue
+                    px = getattr(o, "price", None)
+                    if px is not None:
+                        cur_px = float(px)
+                    break
+                price_ok = (
+                    cur_px is not None and abs(cur_px - target_px) <= eps
+                )
+                if price_ok and rem == vol_req:
+                    return
+                if self.can_trade(1):
+                    self._cancel_order_safe(exchange, dual, st_side.order_id)
+                st_side.order_id = None
+
+        if not self.can_trade(1):
+            return
+        try:
+            r = exchange.insert_order(
+                dual,
+                price=target_px,
+                volume=vol_req,
+                side=side,
+                order_type="limit",
+            )
+        except Exception as e:  # pragma: no cover
+            print(f"  [DUAL MM ERR] {dual} {side} insert: {e}")
+            return
+        self.log_actions(1)
+        oid = self._order_id_from_insert(r)
+        st_side.order_id = oid
+        st_side.placed_trade_seq = st.market_trade_seq
+        st_side.initial_volume = vol_req
+        print(
+            f"  [DUAL MM {side_name.upper()}] {dual}  px={target_px:.2f}  v={vol_req}  "
+            f"oid={oid}  ref_seq={st.market_trade_seq}"
+        )
+
+    def _process_pair(
+        self,
+        exchange: Any,
+        main: str,
+        dual: str,
+        books: Dict[str, Any],
+        virt_pos: Dict[str, int],
+    ) -> None:
+        bk_m = books.get(main)
+        bk_d = books.get(dual)
+        if not (bk_m and bk_d and bk_m.bids and bk_m.asks and bk_d.bids and bk_d.asks):
+            return
+
+        mm = self.mid(bk_m)
+        if mm is None:
+            return
+
+        st = self._state_for(main, dual)
+        n_ticks = self._poll_trade_tick_len(exchange, dual)
+        st.market_trade_seq += n_ticks
+
+        ask_vol_now: Optional[int] = None
+        if st.ask.order_id is not None:
+            ask_vol_now = self._volume_for_order_id(exchange, dual, st.ask.order_id)
+        if (
+            st.prev_ask_outstanding_vol is not None
+            and ask_vol_now is not None
+            and ask_vol_now < st.prev_ask_outstanding_vol
+        ):
+            st.lift_steps += 1
+            print(f"  [DUAL MM LIFT] {dual}  lift_steps={st.lift_steps}")
+
+        bid_px, ask_px = self._intended_dual_prices(mm, st)
+        pos_d = virt_pos.get(dual, 0)
+
+        self._maybe_cancel_stale_resting(exchange, dual, st, st.bid, "bid")
+        self._maybe_cancel_stale_resting(exchange, dual, st, st.ask, "ask")
+
+        self._ensure_limit(exchange, dual, pos_d, "bid", "bid", bid_px, st.bid, st)
+        pos_d = virt_pos.get(dual, 0)
+        self._ensure_limit(exchange, dual, pos_d, "ask", "ask", ask_px, st.ask, st)
+
+        if st.ask.order_id is not None:
+            st.prev_ask_outstanding_vol = self._volume_for_order_id(
+                exchange, dual, st.ask.order_id
+            )
+        else:
+            st.prev_ask_outstanding_vol = None
+
     def _bootstrap(self, exchange: Any) -> None:
         print("=" * 60)
-        print("  Dual-listing z-score trader  —  Starting up")
+        print("  Dual-listing limit quoter (DUAL around MAIN mid)")
         print("=" * 60)
         self._start_time = time.time()
         self._last_status = 0.0
         self._loop_count = 0
+        self._pair_states.clear()
 
         self._all_assets = sorted({s for pair in self.DUAL_PAIRS for s in pair})
-        self._spread_hist = {
-            self._pair_key(m, d): deque(maxlen=self._z_window) for m, d in self.DUAL_PAIRS
-        }
-
         instruments = exchange.get_instruments()
         self._instrument_meta = {
             aid: self._resolve_instrument(instruments, aid) for aid in self._all_assets
@@ -324,20 +390,18 @@ class Trader:
 
         print(
             f"  Instruments: {self._all_assets}  "
-            f"z_nvda=±{self._z_threshold_nvda}  z_nvo=±{self._z_threshold_nvo}  "
-            f"window={self._z_window}"
+            f"quote_diff={self._quote_diff}  increment={self._quote_increment}  "
+            f"stale_ticks={self._cancel_after_market_trades}  vol={self._quote_volume}"
         )
 
         if self._csv_warm_start:
             self._load_csv_warm_start()
 
     def _normalize_csv_to_header(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Ensure columns match ``HEADER`` (missing columns filled like collector blanks)."""
         for c in HEADER:
             if c not in df.columns:
                 df[c] = np.nan
         out = df[list(HEADER)].copy()
-        # Match string empties for optional text fields the collector writes as ""
         for c in ("instrument_id", "instrument_type", "instrument_group", "index_id"):
             if c in out.columns:
                 out[c] = out[c].fillna("").astype(str).replace("nan", "")
@@ -359,7 +423,7 @@ class Trader:
         try:
             norm = self._normalize_csv_to_header(raw)
         except Exception as e:  # pragma: no cover
-            print(f"  [CSV WARN] {instrument_id}: column normalize failed: {e}")
+            print(f"  [CSV WARN] {instrument_id}: normalize failed: {e}")
             return pd.DataFrame(columns=list(HEADER))
         norm["timestamp"] = pd.to_numeric(norm["timestamp"], errors="coerce")
         for c in ("bid_price", "bid_volume", "ask_price", "ask_volume", "mid", "spread", "last_trade_price"):
@@ -368,44 +432,52 @@ class Trader:
         norm = norm.dropna(subset=["timestamp", "mid"], how="any")
         if norm.empty:
             return pd.DataFrame(columns=list(HEADER))
-        norm = norm.sort_values("timestamp").tail(self.TICK_HISTORY_MAX_ROWS).reset_index(drop=True)
-        return norm
+        return norm.sort_values("timestamp").tail(self.TICK_HISTORY_MAX_ROWS).reset_index(drop=True)
 
     def _load_csv_warm_start(self) -> None:
-        """Load per-instrument CSVs into ``_tick_frames`` and seed ``_spread_hist`` from aligned mids."""
         for aid in self._all_assets:
             df = self._read_instrument_csv(aid)
             if not df.empty:
                 self._tick_frames[aid] = df
-                print(f"  [CSV] Loaded {len(df)} row(s) for {aid} from {self._csv_dir!s}")
-            else:
-                p = instrument_csv_path(aid, self._csv_dir, OUTPUT_FILENAME_TEMPLATE)
-                print(f"  [CSV] No data for {aid} (missing or empty: {p})")
-
-        for main, dual in self.DUAL_PAIRS:
-            sk = self._pair_key(main, dual)
-            d_m = self._tick_frames.get(main, pd.DataFrame())
-            d_d = self._tick_frames.get(dual, pd.DataFrame())
-            if d_m.empty or d_d.empty:
-                continue
-            m = d_m[["timestamp", "mid"]].rename(columns={"mid": "mid_main"})
-            d = d_d[["timestamp", "mid"]].rename(columns={"mid": "mid_dual"})
-            merged = m.merge(d, on="timestamp", how="inner").sort_values("timestamp")
-            if merged.empty:
-                print(f"  [CSV] No overlapping timestamps for {main}/{dual}; spread deque empty")
-                continue
-            spreads = (merged["mid_main"] - merged["mid_dual"]).astype(float).tolist()
-            tail = spreads[-self._z_window :]
-            self._spread_hist[sk].clear()
-            self._spread_hist[sk].extend(tail)
-            print(f"  [CSV] Seeded {sk} with {len(self._spread_hist[sk])} spread sample(s)")
+                print(f"  [CSV] Loaded {len(df)} row(s) for {aid}")
 
     def start(self, exchange: Any) -> None:
-        """Initialize books/meta/spread history once after :meth:`Exchange.connect`."""
         self._bootstrap(exchange)
 
+    def run(
+        self,
+        exchange: Any,
+        *,
+        quote_diff: Optional[float] = None,
+        increment: Optional[float] = None,
+        cancel_after_market_trades: Optional[int] = None,
+        quote_volume: Optional[int] = None,
+    ) -> None:
+        """
+        Blocking quote loop. Override tuning without reconstructing ``Trader``::
+
+            Trader().run(
+                exchange,
+                quote_diff=0.5,
+                increment=0.1,
+                cancel_after_market_trades=50,
+                quote_volume=10,
+            )
+        """
+        if quote_diff is not None:
+            self._quote_diff = float(quote_diff)
+        if increment is not None:
+            self._quote_increment = float(increment)
+        if cancel_after_market_trades is not None:
+            self._cancel_after_market_trades = int(cancel_after_market_trades)
+        if quote_volume is not None:
+            self._quote_volume = int(quote_volume)
+        self.start(exchange)
+        while True:
+            self.step(exchange)
+            time.sleep(self.LOOP_SLEEP)
+
     def step(self, exchange: Any) -> None:
-        """Run a single trading tick (fetch books, strategy, tick frames). Safe to call from a shared driver loop."""
         if not self._all_assets:
             self._bootstrap(exchange)
         try:
@@ -413,27 +485,15 @@ class Trader:
         except Exception as e:  # pragma: no cover
             print(f"  [LOOP ERR] {e}")
 
-    def run(self, exchange: Any) -> None:
-        """Blocking 25 Hz loop (``start`` + repeated ``step`` + sleep)."""
-        self.start(exchange)
-        while True:
-            self.step(exchange)
-            time.sleep(self.LOOP_SLEEP)
-
     def _iteration(self, exchange: Any) -> None:
         now = time.time()
         elapsed = now - self._start_time
         self._loop_count += 1
 
         books: Dict[str, Any] = {}
-        mids_snap: Dict[str, float] = {}
         for asset in self._all_assets:
             try:
-                bk = exchange.get_last_price_book(asset)
-                books[asset] = bk
-                m = self.mid(bk)
-                if m is not None:
-                    mids_snap[asset] = m
+                books[asset] = exchange.get_last_price_book(asset)
             except Exception:
                 pass
 
@@ -449,15 +509,12 @@ class Trader:
                 pass
             self._last_status = now
 
-        self._strategy_dual_zscore(books, mids_snap, virt_pos, exchange)
+        for main, dual in self.DUAL_PAIRS:
+            self._process_pair(exchange, main, dual, books, virt_pos)
+
         self.poll_tick_history(exchange, now, books)
 
     def poll_tick_history(self, exchange: Any, ts: float, books: Dict[str, Any]) -> None:
-        """
-        Append one CSV-shaped row per instrument (same columns as ``collect_strategy_data``).
-
-        Uses the books already fetched this tick (no duplicate ``get_last_price_book``).
-        """
         if not exchange.is_connected():
             return
         cols = list(HEADER)
@@ -481,180 +538,6 @@ class Trader:
     def tick_frames(self) -> Dict[str, pd.DataFrame]:
         return self._tick_frames
 
-    def _rolling_spread_z(self, spread_key: str, spread: float) -> Optional[float]:
-        dq = self._spread_hist[spread_key]
-        dq.append(spread)
-        if len(dq) < self._z_window:
-            return None
-        arr = np.array(dq, dtype=float)
-        mu = float(np.mean(arr))
-        sig = float(np.std(arr, ddof=1))
-        if sig < self.Z_STD_EPS:
-            return None
-        return (spread - mu) / sig
-
-    def _strategy_dual_zscore(
-        self,
-        books: Dict[str, Any],
-        mids_snap: Dict[str, float],
-        virt_pos: Dict[str, int],
-        exchange: Any,
-    ) -> None:
-        for main, dual in self.DUAL_PAIRS:
-            bk_m = books.get(main)
-            bk_d = books.get(dual)
-            if not (bk_m and bk_d):
-                continue
-            if not (bk_m.bids and bk_m.asks and bk_d.bids and bk_d.asks):
-                continue
-
-            pos_m = virt_pos.get(main, 0)
-            pos_d = virt_pos.get(dual, 0)
-            gross = max(abs(pos_m), abs(pos_d))
-            hedge_err = pos_m + pos_d
-
-            if gross >= self.POSITION_EMERGENCY_CLEAR:
-                if self._emergency_reduce_pair(
-                    main, dual, bk_m, bk_d, virt_pos, exchange
-                ):
-                    print(
-                        f"  [DUAL Z EMERGENCY] {main}/{dual}  "
-                        f"gross={gross}  hedge_err={hedge_err}"
-                    )
-                continue
-
-            main_mid = mids_snap.get(main)
-            dual_mid = mids_snap.get(dual)
-            if main_mid is None or dual_mid is None:
-                continue
-
-            spread = main_mid - dual_mid
-            sk = self._pair_key(main, dual)
-            z = self._rolling_spread_z(sk, spread)
-            if z is None:
-                continue
-
-            z_thr = self._z_threshold_for_main(main)
-            pos_m = virt_pos.get(main, 0)
-            pos_d = virt_pos.get(dual, 0)
-            gross = max(abs(pos_m), abs(pos_d))
-            hedge_err = pos_m + pos_d
-
-            exit_cap = min(self.CLEAR_CHUNK_LARGE, max(10, gross // 3 + 6))
-
-            if abs(z) < self.Z_EXIT and (pos_m != 0 or pos_d != 0):
-                if pos_m < 0 and bk_m.asks and self.can_trade(1):
-                    v = self.safe_vol(pos_m, min(exit_cap, abs(pos_m)), "bid")
-                    if v > 0:
-                        r = exchange.insert_order(
-                            main, price=bk_m.asks[0].price, volume=v, side="bid", order_type="ioc"
-                        )
-                        self.log_actions(1)
-                        virt_pos[main] = pos_m + v
-                        if self._order_ack_ok(r):
-                            print(f"  [DUAL Z EXIT MAIN] {main} z={z:.3f}  v={v}")
-                elif pos_m > 0 and bk_m.bids and self.can_trade(1):
-                    v = self.safe_vol(pos_m, min(exit_cap, pos_m), "ask")
-                    if v > 0:
-                        r = exchange.insert_order(
-                            main, price=bk_m.bids[0].price, volume=v, side="ask", order_type="ioc"
-                        )
-                        self.log_actions(1)
-                        virt_pos[main] = pos_m - v
-                        if self._order_ack_ok(r):
-                            print(f"  [DUAL Z EXIT MAIN] {main} z={z:.3f}  v={v}")
-                pos_m = virt_pos.get(main, 0)
-                pos_d = virt_pos.get(dual, 0)
-                if pos_d > 0 and bk_d.bids and self.can_trade(1):
-                    v = self.safe_vol(pos_d, min(exit_cap, pos_d), "ask")
-                    if v > 0:
-                        r = exchange.insert_order(
-                            dual, price=bk_d.bids[0].price, volume=v, side="ask", order_type="ioc"
-                        )
-                        self.log_actions(1)
-                        virt_pos[dual] = pos_d - v
-                        if self._order_ack_ok(r):
-                            print(f"  [DUAL Z EXIT DUAL] {dual} z={z:.3f}  v={v}")
-                elif pos_d < 0 and bk_d.asks and self.can_trade(1):
-                    v = self.safe_vol(pos_d, min(exit_cap, abs(pos_d)), "bid")
-                    if v > 0:
-                        r = exchange.insert_order(
-                            dual, price=bk_d.asks[0].price, volume=v, side="bid", order_type="ioc"
-                        )
-                        self.log_actions(1)
-                        virt_pos[dual] = pos_d + v
-                        if self._order_ack_ok(r):
-                            print(f"  [DUAL Z EXIT DUAL] {dual} z={z:.3f}  v={v}")
-                continue
-
-            if abs(hedge_err) > self.HEDGE_IMBALANCE_MAX and self._repair_hedge_imbalance(
-                main, dual, bk_m, bk_d, virt_pos, exchange, hedge_err
-            ):
-                print(
-                    f"  [DUAL Z HEDGE] {main}/{dual}  "
-                    f"hedge_err={hedge_err}  z={z:.3f}"
-                )
-                continue
-
-            pos_m = virt_pos.get(main, 0)
-            pos_d = virt_pos.get(dual, 0)
-            gross = max(abs(pos_m), abs(pos_d))
-            if gross >= self.SKIP_NEW_ENTRY_GROSS:
-                continue
-
-            already_long_spread = (
-                pos_m > self.PAIR_HEDGE_EPS and pos_d < -self.PAIR_HEDGE_EPS
-            )
-            already_short_spread = (
-                pos_m < -self.PAIR_HEDGE_EPS and pos_d > self.PAIR_HEDGE_EPS
-            )
-
-            vol_size = self._scaled_spread_volume(z, z_thr)
-
-            if z >= z_thr:
-                if already_short_spread:
-                    continue
-                v_m = self.safe_vol(pos_m, vol_size, "ask")
-                v_d = self.safe_vol(pos_d, vol_size, "bid")
-                v = min(v_m, v_d)
-                if v > 0 and self.can_trade(2):
-                    r_m = exchange.insert_order(
-                        main, price=bk_m.bids[0].price, volume=v, side="ask", order_type="ioc"
-                    )
-                    r_d = exchange.insert_order(
-                        dual, price=bk_d.asks[0].price, volume=v, side="bid", order_type="ioc"
-                    )
-                    self.log_actions(2)
-                    virt_pos[main] = pos_m - v
-                    virt_pos[dual] = pos_d + v
-                    if self._order_ack_ok(r_m) and self._order_ack_ok(r_d):
-                        print(
-                            f"  [DUAL Z SHORT SPREAD] {main}/{dual}  z={z:.3f}  "
-                            f"spread={spread:.4f}  thr=±{z_thr}  v={v}"
-                        )
-
-            elif z <= -z_thr:
-                if already_long_spread:
-                    continue
-                v_m = self.safe_vol(pos_m, vol_size, "bid")
-                v_d = self.safe_vol(pos_d, vol_size, "ask")
-                v = min(v_m, v_d)
-                if v > 0 and self.can_trade(2):
-                    r_m = exchange.insert_order(
-                        main, price=bk_m.asks[0].price, volume=v, side="bid", order_type="ioc"
-                    )
-                    r_d = exchange.insert_order(
-                        dual, price=bk_d.bids[0].price, volume=v, side="ask", order_type="ioc"
-                    )
-                    self.log_actions(2)
-                    virt_pos[main] = pos_m + v
-                    virt_pos[dual] = pos_d - v
-                    if self._order_ack_ok(r_m) and self._order_ack_ok(r_d):
-                        print(
-                            f"  [DUAL Z LONG SPREAD ] {main}/{dual}  z={z:.3f}  "
-                            f"spread={spread:.4f}  thr=±{z_thr}  v={v}"
-                        )
-
     @staticmethod
     def replay_dual_listing(
         main_mids: np.ndarray,
@@ -663,13 +546,9 @@ class Trader:
         z_threshold: float = 2.0,
         z_window: int = Z_SCORE_WINDOW,
         z_std_eps: float = Z_STD_EPS,
+        z_std_floor: float = Z_ROLLING_STD_FLOOR,
     ) -> List[Dict[str, Any]]:
-        """
-        Replay rolling z on spread (aligned mid arrays; no positions / exits).
-
-        Returns events with keys ``i``, ``kind`` in ``{"short_spread", "long_spread"}``,
-        plus ``spread`` and ``z``.
-        """
+        """Offline rolling z on spread (unchanged signature for notebooks)."""
         m = min(len(main_mids), len(dual_mids))
         main_mids = np.asarray(main_mids[:m], dtype=float)
         dual_mids = np.asarray(dual_mids[:m], dtype=float)
@@ -686,9 +565,8 @@ class Trader:
             arr = np.array(hist, dtype=float)
             mu = float(np.mean(arr))
             sig = float(np.std(arr, ddof=1))
-            if sig < z_std_eps:
-                continue
-            z = (s_now - mu) / sig
+            sig_eff = max(sig, z_std_floor, z_std_eps)
+            z = (s_now - mu) / sig_eff
             if z >= z_threshold:
                 events.append({"i": i, "kind": "short_spread", "spread": s_now, "z": z})
             elif z <= -z_threshold:
@@ -702,7 +580,12 @@ def main() -> None:
 
     exchange = _Exchange()
     exchange.connect()
-    Trader().run(exchange)
+    Trader().run(
+        exchange,
+        quote_diff=0.5,
+        increment=0.1,
+        cancel_after_market_trades=50,
+    )
 
 
 if __name__ == "__main__":
