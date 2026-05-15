@@ -128,6 +128,43 @@ class Trader:
         return max(0, min(requested, cap + pos))
 
     @staticmethod
+    def _order_ack_ok(resp: Any) -> bool:
+        """
+        Best-effort: True if ``insert_order`` looks successful (fill or acceptance).
+
+        Optibook returns a small response object; attribute names vary by version.
+        Prefer explicit fill volume when present; otherwise ``success`` or ``order_id``.
+        """
+        if resp is None:
+            return False
+        if getattr(resp, "success", None) is False:
+            return False
+        for attr in (
+            "filled_volume",
+            "traded_volume",
+            "executed_volume",
+            "volume_executed",
+            "filled",
+        ):
+            if hasattr(resp, attr):
+                raw = getattr(resp, attr)
+                if raw is None:
+                    continue
+                try:
+                    fv = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if fv > 0:
+                    return True
+                return False
+        if getattr(resp, "success", None) is True:
+            return True
+        oid = getattr(resp, "order_id", None)
+        if oid is not None and oid != "" and oid != 0:
+            return True
+        return False
+
+    @staticmethod
     def mid(book: Any) -> Optional[float]:
         if book and book.bids and book.asks:
             return (book.bids[0].price + book.asks[0].price) / 2.0
@@ -369,38 +406,40 @@ class Trader:
                 v_d = self.safe_vol(pos_d, vol_size, "bid")
                 v = min(v_m, v_d)
                 if v > 0 and self.can_trade(2):
-                    print(
-                        f"  [DUAL Z SHORT SPREAD] {main}/{dual}  z={z:.3f}  "
-                        f"spread={spread:.4f}  thr=±{z_thr}"
-                    )
-                    exchange.insert_order(
+                    r_m = exchange.insert_order(
                         main, price=bk_m.bids[0].price, volume=v, side="ask", order_type="ioc"
                     )
-                    exchange.insert_order(
+                    r_d = exchange.insert_order(
                         dual, price=bk_d.asks[0].price, volume=v, side="bid", order_type="ioc"
                     )
                     self.log_actions(2)
                     virt_pos[main] = pos_m - v
                     virt_pos[dual] = pos_d + v
+                    if self._order_ack_ok(r_m) and self._order_ack_ok(r_d):
+                        print(
+                            f"  [DUAL Z SHORT SPREAD] {main}/{dual}  z={z:.3f}  "
+                            f"spread={spread:.4f}  thr=±{z_thr}  v={v}"
+                        )
 
             elif z <= -z_thr:
                 v_m = self.safe_vol(pos_m, vol_size, "bid")
                 v_d = self.safe_vol(pos_d, vol_size, "ask")
                 v = min(v_m, v_d)
                 if v > 0 and self.can_trade(2):
-                    print(
-                        f"  [DUAL Z LONG SPREAD ] {main}/{dual}  z={z:.3f}  "
-                        f"spread={spread:.4f}  thr=±{z_thr}"
-                    )
-                    exchange.insert_order(
+                    r_m = exchange.insert_order(
                         main, price=bk_m.asks[0].price, volume=v, side="bid", order_type="ioc"
                     )
-                    exchange.insert_order(
+                    r_d = exchange.insert_order(
                         dual, price=bk_d.bids[0].price, volume=v, side="ask", order_type="ioc"
                     )
                     self.log_actions(2)
                     virt_pos[main] = pos_m + v
                     virt_pos[dual] = pos_d - v
+                    if self._order_ack_ok(r_m) and self._order_ack_ok(r_d):
+                        print(
+                            f"  [DUAL Z LONG SPREAD ] {main}/{dual}  z={z:.3f}  "
+                            f"spread={spread:.4f}  thr=±{z_thr}  v={v}"
+                        )
 
             elif abs(z) < self.Z_EXIT and (
                 virt_pos.get(main, 0) != 0 or virt_pos.get(dual, 0) != 0
@@ -410,41 +449,45 @@ class Trader:
                 if pos_m < 0 and bk_m.asks and self.can_trade(1):
                     v = self.safe_vol(pos_m, min(10, abs(pos_m)), "bid")
                     if v > 0:
-                        exchange.insert_order(
+                        r = exchange.insert_order(
                             main, price=bk_m.asks[0].price, volume=v, side="bid", order_type="ioc"
                         )
                         self.log_actions(1)
                         virt_pos[main] = pos_m + v
-                        print(f"  [DUAL Z EXIT MAIN] {main} z={z:.3f}")
+                        if self._order_ack_ok(r):
+                            print(f"  [DUAL Z EXIT MAIN] {main} z={z:.3f}  v={v}")
                 elif pos_m > 0 and bk_m.bids and self.can_trade(1):
                     v = self.safe_vol(pos_m, min(10, pos_m), "ask")
                     if v > 0:
-                        exchange.insert_order(
+                        r = exchange.insert_order(
                             main, price=bk_m.bids[0].price, volume=v, side="ask", order_type="ioc"
                         )
                         self.log_actions(1)
                         virt_pos[main] = pos_m - v
-                        print(f"  [DUAL Z EXIT MAIN] {main} z={z:.3f}")
+                        if self._order_ack_ok(r):
+                            print(f"  [DUAL Z EXIT MAIN] {main} z={z:.3f}  v={v}")
                 pos_m = virt_pos.get(main, 0)
                 pos_d = virt_pos.get(dual, 0)
                 if pos_d > 0 and bk_d.bids and self.can_trade(1):
                     v = self.safe_vol(pos_d, min(10, pos_d), "ask")
                     if v > 0:
-                        exchange.insert_order(
+                        r = exchange.insert_order(
                             dual, price=bk_d.bids[0].price, volume=v, side="ask", order_type="ioc"
                         )
                         self.log_actions(1)
                         virt_pos[dual] = pos_d - v
-                        print(f"  [DUAL Z EXIT DUAL] {dual} z={z:.3f}")
+                        if self._order_ack_ok(r):
+                            print(f"  [DUAL Z EXIT DUAL] {dual} z={z:.3f}  v={v}")
                 elif pos_d < 0 and bk_d.asks and self.can_trade(1):
                     v = self.safe_vol(pos_d, min(10, abs(pos_d)), "bid")
                     if v > 0:
-                        exchange.insert_order(
+                        r = exchange.insert_order(
                             dual, price=bk_d.asks[0].price, volume=v, side="bid", order_type="ioc"
                         )
                         self.log_actions(1)
                         virt_pos[dual] = pos_d + v
-                        print(f"  [DUAL Z EXIT DUAL] {dual} z={z:.3f}")
+                        if self._order_ack_ok(r):
+                            print(f"  [DUAL Z EXIT DUAL] {dual} z={z:.3f}  v={v}")
 
     @staticmethod
     def replay_dual_listing(
