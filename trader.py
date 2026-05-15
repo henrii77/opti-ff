@@ -9,7 +9,8 @@ anchored to the **MAIN** mid (e.g. NVDA_DUAL bid/ask around NVDA).
 - Resting dual orders that see ``cancel_after_market_trades`` **public** trade ticks on
   the dual with **no** fill are cancelled.
 
-Live loop: :meth:`Trader.run` (blocking). For a single tick: :meth:`Trader.step`.
+Live loop: :meth:`Trader.run` (blocking). For a single tick: :meth:`Trader.step`
+(:meth:`Trader.step` enforces at most :data:`Trader.MAX_UPDATES_PER_SEC` calls per wall-clock second).
 
 Offline replay helper: :meth:`Trader.replay_dual_listing` (rolling z on spread; unchanged API).
 """
@@ -47,8 +48,11 @@ Z_ROLLING_STD_FLOOR = 0.22
 @dataclass
 class _RestingSide:
     order_id: Optional[Any] = None
-    placed_trade_seq: int = 0
+    placed_trade_seq: int = -1
     initial_volume: int = 0
+    # If insert succeeded but book/API lagged, avoid duplicate inserts for a few loops.
+    pending_target_px: Optional[float] = None
+    pending_until_loop: int = -1
 
 
 @dataclass
@@ -73,8 +77,9 @@ class Trader:
     TICK_SIZE = 0.10
     MAX_POSITION = 99
     SAFE_POSITION = 80
-    LOOP_SLEEP = 0.04
-    RATE_LIMIT = 21
+    # Cap strategy loop / step() rate and trailing-1s exchange action budget.
+    MAX_UPDATES_PER_SEC = 23
+    RATE_LIMIT = MAX_UPDATES_PER_SEC
     DEFAULT_QUOTE_VOLUME = 10
 
     TICK_HISTORY_MAX_ROWS = 10_000
@@ -108,6 +113,16 @@ class Trader:
         self._tick_frames: Dict[str, pd.DataFrame] = {}
         self._loop_count = 0
         self._pair_states: Dict[str, _DualQuoteState] = {}
+        self._next_step_perf: float = -1.0
+
+    def _throttle_step_rate(self) -> None:
+        period = 1.0 / float(type(self).MAX_UPDATES_PER_SEC)
+        now = time.perf_counter()
+        if self._next_step_perf >= 0.0:
+            wait = self._next_step_perf - now
+            if wait > 0:
+                time.sleep(wait)
+        self._next_step_perf = time.perf_counter() + period
 
     def _state_for(self, main: str, dual: str) -> _DualQuoteState:
         key = f"{main}|{dual}"
@@ -157,14 +172,82 @@ class Trader:
         return None
 
     @staticmethod
+    def _normalize_oid(oid: Any) -> Optional[str]:
+        if oid is None or oid == "" or oid == 0:
+            return None
+        return str(oid)
+
+    @staticmethod
     def _order_id_from_insert(resp: Any) -> Optional[Any]:
         if resp is None:
             return None
         if getattr(resp, "success", None) is False:
             return None
-        oid = getattr(resp, "order_id", None)
-        if oid is not None and oid != "" and oid != 0:
-            return oid
+        for attr in ("order_id", "orderId", "id", "orderID"):
+            oid = getattr(resp, attr, None)
+            if oid is not None and oid != "" and oid != 0:
+                return oid
+        return None
+
+    @staticmethod
+    def _order_limit_price(o: Any) -> Optional[float]:
+        for attr in ("price", "limit_price", "limitPrice", "px"):
+            px = getattr(o, attr, None)
+            if px is None and isinstance(o, dict):
+                px = o.get(attr)
+            if px is not None:
+                try:
+                    return float(px)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _side_token(self, o: Any) -> str:
+        s = getattr(o, "side", None)
+        if s is None and isinstance(o, dict):
+            s = o.get("side")
+        if hasattr(s, "name"):
+            return str(getattr(s, "name")).lower()
+        if s is not None:
+            return str(s).lower()
+        return ""
+
+    def _order_matches_side(self, o: Any, side: str) -> bool:
+        t = self._side_token(o)
+        if side == "bid":
+            return any(k in t for k in ("bid", "buy"))
+        return any(k in t for k in ("ask", "sell"))
+
+    def _find_resting_at(
+        self,
+        exchange: Any,
+        dual: str,
+        side: str,
+        target_px: float,
+        eps: float,
+    ) -> Optional[Tuple[Any, int, float]]:
+        """Our resting limit at ``target_px`` (best-effort: price + side match)."""
+        tgt = self.round_tick(target_px)
+        for o in self._outstanding_orders(exchange, dual):
+            if not self._order_matches_side(o, side):
+                continue
+            fp = self._order_limit_price(o)
+            if fp is None:
+                continue
+            fp = self.round_tick(fp)
+            if abs(fp - tgt) > eps:
+                continue
+            oid = getattr(o, "order_id", getattr(o, "id", None))
+            v = getattr(o, "volume", None)
+            if v is None:
+                continue
+            try:
+                rem = int(v)
+            except (TypeError, ValueError):
+                continue
+            if rem <= 0:
+                continue
+            return (oid, rem, fp)
         return None
 
     @staticmethod
@@ -189,18 +272,35 @@ class Trader:
             return []
         return list(oo)
 
-    def _volume_for_order_id(self, exchange: Any, dual: str, order_id: Any) -> Optional[int]:
+    def _price_for_order_id(self, exchange: Any, dual: str, order_id: Any) -> Optional[float]:
+        want = self._normalize_oid(order_id)
+        if want is None:
+            return None
         for o in self._outstanding_orders(exchange, dual):
             oid = getattr(o, "order_id", None)
             if oid is None and o is not None:
                 oid = getattr(o, "id", None)
-            if oid == order_id:
-                v = getattr(o, "volume", None)
-                if v is not None:
-                    try:
-                        return int(v)
-                    except (TypeError, ValueError):
-                        pass
+            if self._normalize_oid(oid) != want:
+                continue
+            return self._order_limit_price(o)
+        return None
+
+    def _volume_for_order_id(self, exchange: Any, dual: str, order_id: Any) -> Optional[int]:
+        want = self._normalize_oid(order_id)
+        if want is None:
+            return None
+        for o in self._outstanding_orders(exchange, dual):
+            oid = getattr(o, "order_id", None)
+            if oid is None and o is not None:
+                oid = getattr(o, "id", None)
+            if self._normalize_oid(oid) != want:
+                continue
+            v = getattr(o, "volume", None)
+            if v is not None:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    pass
         return None
 
     def _cancel_order_safe(self, exchange: Any, dual: str, order_id: Any) -> None:
@@ -236,12 +336,17 @@ class Trader:
     ) -> None:
         if side.order_id is None:
             return
+        if side.placed_trade_seq < 0:
+            return
         if st.market_trade_seq - side.placed_trade_seq < self._cancel_after_market_trades:
             return
         rem = self._volume_for_order_id(exchange, dual, side.order_id)
         if rem is None:
             # Order gone (filled/cancelled elsewhere) — clear handle
             side.order_id = None
+            side.placed_trade_seq = -1
+            side.pending_target_px = None
+            side.pending_until_loop = -1
             return
         if rem < side.initial_volume:
             return
@@ -250,6 +355,9 @@ class Trader:
         self._cancel_order_safe(exchange, dual, side.order_id)
         side.order_id = None
         side.initial_volume = 0
+        side.placed_trade_seq = -1
+        side.pending_target_px = None
+        side.pending_until_loop = -1
         print(
             f"  [DUAL MM STALE {side_name.upper()}] {dual}  "
             f"cancel after {self._cancel_after_market_trades} mkt ticks w/o fill"
@@ -271,33 +379,64 @@ class Trader:
             if st_side.order_id is not None and self.can_trade(1):
                 self._cancel_order_safe(exchange, dual, st_side.order_id)
                 st_side.order_id = None
+                st_side.placed_trade_seq = -1
+            st_side.pending_target_px = None
+            st_side.pending_until_loop = -1
             return
 
         target_px = self.round_tick(target_px)
-        eps = self.TICK_SIZE / 4
+        eps = self.TICK_SIZE * 0.5 + 1e-9
 
+        # Same-target insert may not appear in outstanding immediately; wait a few loops.
+        if (
+            st_side.pending_target_px is not None
+            and st_side.pending_until_loop >= 0
+            and self._loop_count <= st_side.pending_until_loop
+        ):
+            if abs(self.round_tick(float(st_side.pending_target_px)) - target_px) <= self.TICK_SIZE / 4:
+                hitp = self._find_resting_at(exchange, dual, side, target_px, eps)
+                if hitp is not None:
+                    oidp, remp, _ = hitp
+                    st_side.order_id = oidp
+                    st_side.initial_volume = remp
+                    if st_side.placed_trade_seq < 0:
+                        st_side.placed_trade_seq = st.market_trade_seq
+                    st_side.pending_target_px = None
+                    st_side.pending_until_loop = -1
+                    return
+                return
+        st_side.pending_target_px = None
+        st_side.pending_until_loop = -1
+
+        hit = self._find_resting_at(exchange, dual, side, target_px, eps)
+        if hit is not None:
+            oid, rem, _ = hit
+            st_side.order_id = oid
+            st_side.initial_volume = rem
+            if st_side.placed_trade_seq < 0:
+                st_side.placed_trade_seq = st.market_trade_seq
+            st_side.pending_target_px = None
+            st_side.pending_until_loop = -1
+            return
+
+        # Tracked order still at target but _find_resting_at missed (side repr quirks) — keep.
         if st_side.order_id is not None:
             rem = self._volume_for_order_id(exchange, dual, st_side.order_id)
-            if rem is None or rem <= 0:
-                st_side.order_id = None
-            else:
-                cur_px: Optional[float] = None
-                for o in self._outstanding_orders(exchange, dual):
-                    oid = getattr(o, "order_id", getattr(o, "id", None))
-                    if oid != st_side.order_id:
-                        continue
-                    px = getattr(o, "price", None)
-                    if px is not None:
-                        cur_px = float(px)
-                    break
-                price_ok = (
-                    cur_px is not None and abs(cur_px - target_px) <= eps
-                )
-                if price_ok and rem == vol_req:
+            px_known = self._price_for_order_id(exchange, dual, st_side.order_id)
+            if rem is not None and rem > 0 and px_known is not None:
+                rp = self.round_tick(px_known)
+                if abs(rp - target_px) <= eps:
+                    st_side.initial_volume = rem
+                    if st_side.placed_trade_seq < 0:
+                        st_side.placed_trade_seq = st.market_trade_seq
+                    st_side.pending_target_px = None
+                    st_side.pending_until_loop = -1
                     return
-                if self.can_trade(1):
+            if rem is not None and rem > 0 and self.can_trade(1):
+                if px_known is None or abs(self.round_tick(px_known) - target_px) > eps:
                     self._cancel_order_safe(exchange, dual, st_side.order_id)
-                st_side.order_id = None
+            st_side.order_id = None
+            st_side.placed_trade_seq = -1
 
         if not self.can_trade(1):
             return
@@ -312,11 +451,28 @@ class Trader:
         except Exception as e:  # pragma: no cover
             print(f"  [DUAL MM ERR] {dual} {side} insert: {e}")
             return
+        if getattr(r, "success", None) is False:
+            return
         self.log_actions(1)
         oid = self._order_id_from_insert(r)
+        if oid is None:
+            time.sleep(0.02)
+            hit2 = self._find_resting_at(exchange, dual, side, target_px, eps)
+            if hit2 is not None:
+                oid, rem2, _ = hit2
+                st_side.initial_volume = rem2
+                st_side.pending_target_px = None
+                st_side.pending_until_loop = -1
+            else:
+                st_side.initial_volume = vol_req
+                st_side.pending_target_px = float(target_px)
+                st_side.pending_until_loop = self._loop_count + 5
+        else:
+            st_side.initial_volume = vol_req
+            st_side.pending_target_px = None
+            st_side.pending_until_loop = -1
         st_side.order_id = oid
         st_side.placed_trade_seq = st.market_trade_seq
-        st_side.initial_volume = vol_req
         print(
             f"  [DUAL MM {side_name.upper()}] {dual}  px={target_px:.2f}  v={vol_req}  "
             f"oid={oid}  ref_seq={st.market_trade_seq}"
@@ -475,9 +631,12 @@ class Trader:
         self.start(exchange)
         while True:
             self.step(exchange)
-            time.sleep(self.LOOP_SLEEP)
 
     def step(self, exchange: Any) -> None:
+        self._throttle_step_rate()
+        # Avoid touching the client when the session is down (prevents reconnect spam).
+        if not exchange.is_connected():
+            return
         if not self._all_assets:
             self._bootstrap(exchange)
         try:
@@ -490,6 +649,9 @@ class Trader:
         elapsed = now - self._start_time
         self._loop_count += 1
 
+        if not exchange.is_connected():
+            return
+
         books: Dict[str, Any] = {}
         for asset in self._all_assets:
             try:
@@ -497,7 +659,10 @@ class Trader:
             except Exception:
                 pass
 
-        positions = exchange.get_positions()
+        try:
+            positions = exchange.get_positions()
+        except Exception:
+            return
         virt_pos: Dict[str, int] = dict(positions)
 
         if now - self._last_status > 15:
