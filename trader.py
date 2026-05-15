@@ -57,6 +57,18 @@ class Trader:
     Z_SCORE_WINDOW = 50
     Z_STD_EPS = 1e-9
     Z_EXIT = 0.3
+    # Risk: max(|main|, |dual|) — above this we only shrink inventory (ignore z entries).
+    POSITION_EMERGENCY_CLEAR = 55
+    CLEAR_CHUNK_LARGE = 28
+    # Do not open new spread trades if either leg already this large (prevents pyramiding).
+    SKIP_NEW_ENTRY_GROSS = 42
+    # Treat pair as already "in" a long-spread / short-spread trade if legs exceed this hedge band.
+    PAIR_HEDGE_EPS = 4
+    # |pos_main + pos_dual| should be ~0 if both legs filled equally; above this, repair main first.
+    HEDGE_IMBALANCE_MAX = 10
+    HEDGE_REPAIR_CHUNK = 12
+    # Scale size by |z|/z_thr, capped (so huge z does not single-tick max the book).
+    Z_VOL_MULT_MAX = 3.0
 
     TICK_HISTORY_MAX_ROWS = 10_000
 
@@ -126,6 +138,119 @@ class Trader:
         if side == "bid":
             return max(0, min(requested, cap - pos))
         return max(0, min(requested, cap + pos))
+
+    def _scaled_spread_volume(self, z: float, z_thr: float) -> int:
+        """Larger |z| vs threshold → larger clip (IOC), capped."""
+        mag = abs(z) / max(float(z_thr), 1e-9)
+        mult = min(self.Z_VOL_MULT_MAX, max(1.0, mag))
+        raw = int(round(self.BASE_VOLUME * mult))
+        return max(1, min(raw, 28))
+
+    def _emergency_reduce_pair(
+        self,
+        main: str,
+        dual: str,
+        bk_m: Any,
+        bk_d: Any,
+        virt_pos: Dict[str, int],
+        exchange: Any,
+    ) -> bool:
+        """Shrink large legs toward flat. Returns True if any order sent."""
+        pos_m = virt_pos.get(main, 0)
+        pos_d = virt_pos.get(dual, 0)
+        ch = self.CLEAR_CHUNK_LARGE
+        sent = False
+
+        def leg_main() -> None:
+            nonlocal sent, pos_m
+            if pos_m > 0 and bk_m.bids and self.can_trade(1):
+                v = min(ch, pos_m, self.safe_vol(pos_m, ch, "ask"))
+                if v > 0:
+                    exchange.insert_order(
+                        main, price=bk_m.bids[0].price, volume=v, side="ask", order_type="ioc"
+                    )
+                    self.log_actions(1)
+                    virt_pos[main] = pos_m - v
+                    sent = True
+            elif pos_m < 0 and bk_m.asks and self.can_trade(1):
+                v = min(ch, abs(pos_m), self.safe_vol(pos_m, ch, "bid"))
+                if v > 0:
+                    exchange.insert_order(
+                        main, price=bk_m.asks[0].price, volume=v, side="bid", order_type="ioc"
+                    )
+                    self.log_actions(1)
+                    virt_pos[main] = pos_m + v
+                    sent = True
+
+        def leg_dual() -> None:
+            nonlocal sent, pos_d
+            if pos_d > 0 and bk_d.bids and self.can_trade(1):
+                v = min(ch, pos_d, self.safe_vol(pos_d, ch, "ask"))
+                if v > 0:
+                    exchange.insert_order(
+                        dual, price=bk_d.bids[0].price, volume=v, side="ask", order_type="ioc"
+                    )
+                    self.log_actions(1)
+                    virt_pos[dual] = pos_d - v
+                    sent = True
+            elif pos_d < 0 and bk_d.asks and self.can_trade(1):
+                v = min(ch, abs(pos_d), self.safe_vol(pos_d, ch, "bid"))
+                if v > 0:
+                    exchange.insert_order(
+                        dual, price=bk_d.asks[0].price, volume=v, side="bid", order_type="ioc"
+                    )
+                    self.log_actions(1)
+                    virt_pos[dual] = pos_d + v
+                    sent = True
+
+        if abs(pos_m) >= abs(pos_d):
+            leg_main()
+            pos_m = virt_pos.get(main, 0)
+            pos_d = virt_pos.get(dual, 0)
+            leg_dual()
+        else:
+            leg_dual()
+            pos_m = virt_pos.get(main, 0)
+            pos_d = virt_pos.get(dual, 0)
+            leg_main()
+        return sent
+
+    def _repair_hedge_imbalance(
+        self,
+        main: str,
+        dual: str,
+        bk_m: Any,
+        bk_d: Any,
+        virt_pos: Dict[str, int],
+        exchange: Any,
+        hedge_err: int,
+    ) -> bool:
+        """
+        pos_main + pos_dual should be ~0 for a balanced dual arb.
+        Positive hedge_err → net long risk on the pair expression — trim main (sell if long).
+        Negative → buy back main if short.
+        """
+        ch = self.HEDGE_REPAIR_CHUNK
+        pos_m = virt_pos.get(main, 0)
+        if hedge_err > 0 and pos_m > 0 and bk_m.bids and self.can_trade(1):
+            v = min(ch, hedge_err, pos_m, self.safe_vol(pos_m, ch, "ask"))
+            if v > 0:
+                exchange.insert_order(
+                    main, price=bk_m.bids[0].price, volume=v, side="ask", order_type="ioc"
+                )
+                self.log_actions(1)
+                virt_pos[main] = pos_m - v
+                return True
+        if hedge_err < 0 and pos_m < 0 and bk_m.asks and self.can_trade(1):
+            v = min(ch, abs(hedge_err), abs(pos_m), self.safe_vol(pos_m, ch, "bid"))
+            if v > 0:
+                exchange.insert_order(
+                    main, price=bk_m.asks[0].price, volume=v, side="bid", order_type="ioc"
+                )
+                self.log_actions(1)
+                virt_pos[main] = pos_m + v
+                return True
+        return False
 
     @staticmethod
     def _order_ack_ok(resp: Any) -> bool:
@@ -375,14 +500,27 @@ class Trader:
         virt_pos: Dict[str, int],
         exchange: Any,
     ) -> None:
-        vol_size = max(1, int(self.BASE_VOLUME))
-
         for main, dual in self.DUAL_PAIRS:
             bk_m = books.get(main)
             bk_d = books.get(dual)
             if not (bk_m and bk_d):
                 continue
             if not (bk_m.bids and bk_m.asks and bk_d.bids and bk_d.asks):
+                continue
+
+            pos_m = virt_pos.get(main, 0)
+            pos_d = virt_pos.get(dual, 0)
+            gross = max(abs(pos_m), abs(pos_d))
+            hedge_err = pos_m + pos_d
+
+            if gross >= self.POSITION_EMERGENCY_CLEAR:
+                if self._emergency_reduce_pair(
+                    main, dual, bk_m, bk_d, virt_pos, exchange
+                ):
+                    print(
+                        f"  [DUAL Z EMERGENCY] {main}/{dual}  "
+                        f"gross={gross}  hedge_err={hedge_err}"
+                    )
                 continue
 
             main_mid = mids_snap.get(main)
@@ -393,15 +531,89 @@ class Trader:
             spread = main_mid - dual_mid
             sk = self._pair_key(main, dual)
             z = self._rolling_spread_z(sk, spread)
-            z_thr = self._z_threshold_for_main(main)
-
-            pos_m = virt_pos.get(main, 0)
-            pos_d = virt_pos.get(dual, 0)
-
             if z is None:
                 continue
 
+            z_thr = self._z_threshold_for_main(main)
+            pos_m = virt_pos.get(main, 0)
+            pos_d = virt_pos.get(dual, 0)
+            gross = max(abs(pos_m), abs(pos_d))
+            hedge_err = pos_m + pos_d
+
+            exit_cap = min(self.CLEAR_CHUNK_LARGE, max(10, gross // 3 + 6))
+
+            if abs(z) < self.Z_EXIT and (pos_m != 0 or pos_d != 0):
+                if pos_m < 0 and bk_m.asks and self.can_trade(1):
+                    v = self.safe_vol(pos_m, min(exit_cap, abs(pos_m)), "bid")
+                    if v > 0:
+                        r = exchange.insert_order(
+                            main, price=bk_m.asks[0].price, volume=v, side="bid", order_type="ioc"
+                        )
+                        self.log_actions(1)
+                        virt_pos[main] = pos_m + v
+                        if self._order_ack_ok(r):
+                            print(f"  [DUAL Z EXIT MAIN] {main} z={z:.3f}  v={v}")
+                elif pos_m > 0 and bk_m.bids and self.can_trade(1):
+                    v = self.safe_vol(pos_m, min(exit_cap, pos_m), "ask")
+                    if v > 0:
+                        r = exchange.insert_order(
+                            main, price=bk_m.bids[0].price, volume=v, side="ask", order_type="ioc"
+                        )
+                        self.log_actions(1)
+                        virt_pos[main] = pos_m - v
+                        if self._order_ack_ok(r):
+                            print(f"  [DUAL Z EXIT MAIN] {main} z={z:.3f}  v={v}")
+                pos_m = virt_pos.get(main, 0)
+                pos_d = virt_pos.get(dual, 0)
+                if pos_d > 0 and bk_d.bids and self.can_trade(1):
+                    v = self.safe_vol(pos_d, min(exit_cap, pos_d), "ask")
+                    if v > 0:
+                        r = exchange.insert_order(
+                            dual, price=bk_d.bids[0].price, volume=v, side="ask", order_type="ioc"
+                        )
+                        self.log_actions(1)
+                        virt_pos[dual] = pos_d - v
+                        if self._order_ack_ok(r):
+                            print(f"  [DUAL Z EXIT DUAL] {dual} z={z:.3f}  v={v}")
+                elif pos_d < 0 and bk_d.asks and self.can_trade(1):
+                    v = self.safe_vol(pos_d, min(exit_cap, abs(pos_d)), "bid")
+                    if v > 0:
+                        r = exchange.insert_order(
+                            dual, price=bk_d.asks[0].price, volume=v, side="bid", order_type="ioc"
+                        )
+                        self.log_actions(1)
+                        virt_pos[dual] = pos_d + v
+                        if self._order_ack_ok(r):
+                            print(f"  [DUAL Z EXIT DUAL] {dual} z={z:.3f}  v={v}")
+                continue
+
+            if abs(hedge_err) > self.HEDGE_IMBALANCE_MAX and self._repair_hedge_imbalance(
+                main, dual, bk_m, bk_d, virt_pos, exchange, hedge_err
+            ):
+                print(
+                    f"  [DUAL Z HEDGE] {main}/{dual}  "
+                    f"hedge_err={hedge_err}  z={z:.3f}"
+                )
+                continue
+
+            pos_m = virt_pos.get(main, 0)
+            pos_d = virt_pos.get(dual, 0)
+            gross = max(abs(pos_m), abs(pos_d))
+            if gross >= self.SKIP_NEW_ENTRY_GROSS:
+                continue
+
+            already_long_spread = (
+                pos_m > self.PAIR_HEDGE_EPS and pos_d < -self.PAIR_HEDGE_EPS
+            )
+            already_short_spread = (
+                pos_m < -self.PAIR_HEDGE_EPS and pos_d > self.PAIR_HEDGE_EPS
+            )
+
+            vol_size = self._scaled_spread_volume(z, z_thr)
+
             if z >= z_thr:
+                if already_short_spread:
+                    continue
                 v_m = self.safe_vol(pos_m, vol_size, "ask")
                 v_d = self.safe_vol(pos_d, vol_size, "bid")
                 v = min(v_m, v_d)
@@ -422,6 +634,8 @@ class Trader:
                         )
 
             elif z <= -z_thr:
+                if already_long_spread:
+                    continue
                 v_m = self.safe_vol(pos_m, vol_size, "bid")
                 v_d = self.safe_vol(pos_d, vol_size, "ask")
                 v = min(v_m, v_d)
@@ -440,54 +654,6 @@ class Trader:
                             f"  [DUAL Z LONG SPREAD ] {main}/{dual}  z={z:.3f}  "
                             f"spread={spread:.4f}  thr=±{z_thr}  v={v}"
                         )
-
-            elif abs(z) < self.Z_EXIT and (
-                virt_pos.get(main, 0) != 0 or virt_pos.get(dual, 0) != 0
-            ):
-                pos_m = virt_pos.get(main, 0)
-                pos_d = virt_pos.get(dual, 0)
-                if pos_m < 0 and bk_m.asks and self.can_trade(1):
-                    v = self.safe_vol(pos_m, min(10, abs(pos_m)), "bid")
-                    if v > 0:
-                        r = exchange.insert_order(
-                            main, price=bk_m.asks[0].price, volume=v, side="bid", order_type="ioc"
-                        )
-                        self.log_actions(1)
-                        virt_pos[main] = pos_m + v
-                        if self._order_ack_ok(r):
-                            print(f"  [DUAL Z EXIT MAIN] {main} z={z:.3f}  v={v}")
-                elif pos_m > 0 and bk_m.bids and self.can_trade(1):
-                    v = self.safe_vol(pos_m, min(10, pos_m), "ask")
-                    if v > 0:
-                        r = exchange.insert_order(
-                            main, price=bk_m.bids[0].price, volume=v, side="ask", order_type="ioc"
-                        )
-                        self.log_actions(1)
-                        virt_pos[main] = pos_m - v
-                        if self._order_ack_ok(r):
-                            print(f"  [DUAL Z EXIT MAIN] {main} z={z:.3f}  v={v}")
-                pos_m = virt_pos.get(main, 0)
-                pos_d = virt_pos.get(dual, 0)
-                if pos_d > 0 and bk_d.bids and self.can_trade(1):
-                    v = self.safe_vol(pos_d, min(10, pos_d), "ask")
-                    if v > 0:
-                        r = exchange.insert_order(
-                            dual, price=bk_d.bids[0].price, volume=v, side="ask", order_type="ioc"
-                        )
-                        self.log_actions(1)
-                        virt_pos[dual] = pos_d - v
-                        if self._order_ack_ok(r):
-                            print(f"  [DUAL Z EXIT DUAL] {dual} z={z:.3f}  v={v}")
-                elif pos_d < 0 and bk_d.asks and self.can_trade(1):
-                    v = self.safe_vol(pos_d, min(10, abs(pos_d)), "bid")
-                    if v > 0:
-                        r = exchange.insert_order(
-                            dual, price=bk_d.asks[0].price, volume=v, side="bid", order_type="ioc"
-                        )
-                        self.log_actions(1)
-                        virt_pos[dual] = pos_d + v
-                        if self._order_ack_ok(r):
-                            print(f"  [DUAL Z EXIT DUAL] {dual} z={z:.3f}  v={v}")
 
     @staticmethod
     def replay_dual_listing(
