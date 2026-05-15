@@ -5,9 +5,13 @@ CSV output defaults to ``data/csv/`` under this package. Override with ``run_col
 
 Optibook allows **only one active session per account**. If another script, notebook, or machine connects with the same credentials, this process will be disconnected and the collector exits cleanly instead of crashing.
 
-**Run from repo root:**
+**Run from repo root (blocking poll loop):**
 
     PYTHONPATH=. python data/collect_strategy_data.py
+
+**Compose with other loops (one CSV round-trip per call):** use
+:func:`init_collector_state` once, then :func:`collector_poll_once` each cycle
+(see ``live_collector_and_trader.ipynb`` in the repo root).
 """
 
 from __future__ import annotations
@@ -200,14 +204,20 @@ def snapshot_row_with_book(
     ]
 
 
-def run_collector(
+def init_collector_state(
     exchange: Exchange,
-    poll_interval: float = POLL_INTERVAL,
+    *,
     output_dir: Union[str, Path] = OUTPUT_DIR,
     filename_template: str = OUTPUT_FILENAME_TEMPLATE,
     instrument_ids: Optional[Sequence[str]] = None,
     include_types: Optional[Set[InstrumentType]] = None,
-) -> None:
+) -> Tuple[List[Tuple[str, Any]], List[Path]]:
+    """
+    One-time setup: discover universe, ensure CSV paths/headers.
+
+    Use with :func:`collector_poll_once` from a driver loop (e.g. a notebook that
+    also steps :class:`trader.Trader` each cycle).
+    """
     inc = include_types if include_types is not None else INCLUDE_TYPES
     explicit = list(instrument_ids) if instrument_ids is not None else INSTRUMENT_IDS
     out_dir = Path(output_dir)
@@ -223,9 +233,62 @@ def run_collector(
     mode = "explicit list" if explicit else "discovered"
     print(
         f"Universe ({mode}): {len(universe)} instrument(s). "
-        f"Writing under {str(out_dir.resolve())!r} "
-        f"({filename_template!r}) every {poll_interval}s. Ctrl+C to stop."
+        f"CSV dir {str(out_dir.resolve())!r} ({filename_template!r})."
     )
+    return universe, paths
+
+
+def collector_poll_once(
+    exchange: Exchange,
+    universe: List[Tuple[str, Any]],
+    paths: List[Path],
+    *,
+    ts: Optional[float] = None,
+) -> bool:
+    """
+    Append one snapshot row per instrument. Returns ``False`` if disconnected
+    (caller should stop the outer loop).
+    """
+    disconnect_msg = (
+        "\n[collect_strategy_data] Disconnected from Optibook — stopping.\n"
+        "  Common cause: another client logged in with the same credentials "
+        "(only one live session is allowed). Close the other session and restart this script.\n"
+    )
+    if not exchange.is_connected():
+        print(disconnect_msg)
+        return False
+
+    t = time.time() if ts is None else float(ts)
+    for (inst_id, inst), path in zip(universe, paths):
+        try:
+            row = snapshot_row(t, inst_id, inst, exchange)
+        except AssertionError:
+            if not exchange.is_connected():
+                print(disconnect_msg)
+                return False
+            raise
+        with open(path, "a", newline="") as f:
+            csv.writer(f).writerow(row)
+    return True
+
+
+def run_collector(
+    exchange: Exchange,
+    poll_interval: float = POLL_INTERVAL,
+    output_dir: Union[str, Path] = OUTPUT_DIR,
+    filename_template: str = OUTPUT_FILENAME_TEMPLATE,
+    instrument_ids: Optional[Sequence[str]] = None,
+    include_types: Optional[Set[InstrumentType]] = None,
+) -> None:
+    universe, paths = init_collector_state(
+        exchange,
+        output_dir=output_dir,
+        filename_template=filename_template,
+        instrument_ids=instrument_ids,
+        include_types=include_types,
+    )
+
+    print(f"Polling every {poll_interval}s. Ctrl+C to stop.")
 
     disconnect_msg = (
         "\n[collect_strategy_data] Disconnected from Optibook — stopping.\n"
@@ -240,17 +303,8 @@ def run_collector(
                 return
 
             loop_start = time.time()
-            ts = time.time()
-            for (inst_id, inst), path in zip(universe, paths):
-                try:
-                    row = snapshot_row(ts, inst_id, inst, exchange)
-                except AssertionError:
-                    if not exchange.is_connected():
-                        print(disconnect_msg)
-                        return
-                    raise
-                with open(path, "a", newline="") as f:
-                    csv.writer(f).writerow(row)
+            if not collector_poll_once(exchange, universe, paths):
+                return
 
             elapsed = time.time() - loop_start
             if elapsed < poll_interval:

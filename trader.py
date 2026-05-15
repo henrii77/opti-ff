@@ -8,6 +8,9 @@ with optional flat-z partial exits.
 Offline: :meth:`Trader.replay_dual_listing` for aligned mid arrays (rolling z, no sklearn).
 
 Tick history: same CSV-shaped :class:`pandas.DataFrame` rows as ``collect_strategy_data``.
+
+Live loop: :meth:`Trader.run` (blocking). To interleave with another coroutine (e.g.
+``collector_poll_once`` in a notebook), call :meth:`Trader.start` once then :meth:`Trader.step` each cycle.
 """
 
 from __future__ import annotations
@@ -145,14 +148,24 @@ class Trader:
             f"window={self._z_window}"
         )
 
-    def run(self, exchange: Any) -> None:
-        """Main loop (blocks forever)."""
+    def start(self, exchange: Any) -> None:
+        """Initialize books/meta/spread history once after :meth:`Exchange.connect`."""
         self._bootstrap(exchange)
+
+    def step(self, exchange: Any) -> None:
+        """Run a single trading tick (fetch books, strategy, tick frames). Safe to call from a shared driver loop."""
+        if not self._all_assets:
+            self._bootstrap(exchange)
+        try:
+            self._iteration(exchange)
+        except Exception as e:  # pragma: no cover
+            print(f"  [LOOP ERR] {e}")
+
+    def run(self, exchange: Any) -> None:
+        """Blocking 25 Hz loop (``start`` + repeated ``step`` + sleep)."""
+        self.start(exchange)
         while True:
-            try:
-                self._iteration(exchange)
-            except Exception as e:  # pragma: no cover
-                print(f"  [LOOP ERR] {e}")
+            self.step(exchange)
             time.sleep(self.LOOP_SLEEP)
 
     def _iteration(self, exchange: Any) -> None:
