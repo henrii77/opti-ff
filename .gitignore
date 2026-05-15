@@ -1,3 +1,6 @@
 # Generated strategy market CSVs (collector / notebooks; do not commit)
 data/csv/**/*.csv
 data/csv/.ipynb_checkpoints/
+
+# Vol lab generated CSVs
+vol lab/*.csv
