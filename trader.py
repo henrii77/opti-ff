@@ -1,6 +1,6 @@
 """
-Dual-listing market making on the **DUAL** line only: resting **limit** orders
-anchored to the **MAIN** mid (e.g. NVDA_DUAL bid/ask around NVDA).
+Dual-listing market making on **DUAL** (resting limits vs **MAIN** mid) plus optional
+**index vs calendar futures** IOC edge (weighted index fair vs OB5X contracts).
 
 - Initial quotes: ``bid_dual = main_mid - quote_diff``, ``ask_dual = main_mid + quote_diff``
   (prices rounded to :data:`Trader.TICK_SIZE`).
@@ -8,6 +8,9 @@ anchored to the **MAIN** mid (e.g. NVDA_DUAL bid/ask around NVDA).
   ``increment``, clamped so ``bid_dual <= main_mid`` and ``ask_dual >= main_mid``.
 - Resting dual orders that see ``cancel_after_market_trades`` **public** trade ticks on
   the dual with **no** fill are cancelled.
+
+Futures: weighted index mid vs fair ``X_t * exp(r * tau)`` per OB5X contract; IOC entries and
+profit-locked exits use :data:`Trader.MAX_FUTURES_ACTIONS_PER_SEC` (separate from dual insert cap).
 
 Live loop: :meth:`Trader.run` (blocking). For a single tick: :meth:`Trader.step`
 (throttled to :data:`Trader.MAX_STEP_CALLS_PER_SEC` / s). At most one full dual-quote **cycle** per
@@ -20,6 +23,7 @@ Offline replay helper: :meth:`Trader.replay_dual_listing` (rolling z on spread; 
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -77,6 +81,23 @@ class Trader:
         ("NVO", "NVO_DUAL"),
     ]
 
+    # --- Index vs futures (IOC); weights match user basket / 1000 scale ---
+    INDEX_WEIGHTS: Dict[str, float] = {
+        "AMZN": 953.21,
+        "JPM": 129.25,
+        "NVDA": 908.06,
+        "XOM": 2245.39,
+        "NVO": 124.78,
+    }
+    FUTURES_TAU: Dict[str, float] = {
+        "OB5X_202609_F": 4 / 12.0,
+        "OB5X_202612_F": 7 / 12.0,
+        "OB5X_202703_F": 10 / 12.0,
+    }
+    FUTURES_RISK_FREE_RATE = 0.03
+    FUTURES_MAX_POS = 85
+    MAX_FUTURES_ACTIONS_PER_SEC = 21
+
     TICK_SIZE = 0.10
     MAX_POSITION = 99
     SAFE_POSITION = 80
@@ -123,6 +144,10 @@ class Trader:
         self._loop_count = 0
         self._pair_states: Dict[str, _DualQuoteState] = {}
         self._next_step_perf: float = -1.0
+        self._futures_vwap: Dict[str, Dict[str, float]] = {
+            f: {"pos": 0, "cost_basis": 0.0} for f in type(self).FUTURES_TAU
+        }
+        self._futures_action_ts: Deque[float] = deque()
 
     def _throttle_step_rate(self) -> None:
         period = 1.0 / float(type(self).MAX_STEP_CALLS_PER_SEC)
@@ -649,9 +674,189 @@ class Trader:
             else:
                 st.prev_ask_outstanding_vol = None
 
+    @staticmethod
+    def _futures_dynamic_volume(edge: float) -> int:
+        if edge >= 0.80:
+            return 25
+        if edge >= 0.40:
+            return 10
+        if edge >= 0.15:
+            return 5
+        return 0
+
+    def _futures_actions_can(self, n: int = 1) -> bool:
+        now = time.time()
+        lim = int(type(self).MAX_FUTURES_ACTIONS_PER_SEC)
+        while self._futures_action_ts and now - self._futures_action_ts[0] >= 1.0:
+            self._futures_action_ts.popleft()
+        return len(self._futures_action_ts) + n <= lim
+
+    def _futures_actions_record(self, n: int = 1) -> None:
+        now = time.time()
+        for _ in range(n):
+            self._futures_action_ts.append(now)
+
+    def _futures_update_vwap(self, fut: str, trade_vol: int, trade_price: float, side: str) -> None:
+        v = self._futures_vwap[fut]
+        current_pos = int(v["pos"])
+        current_cost = float(v["cost_basis"])
+
+        if side == "bid":
+            if current_pos >= 0:
+                new_pos = current_pos + trade_vol
+                new_cost = (
+                    (current_pos * current_cost) + (trade_vol * trade_price)
+                ) / max(new_pos, 1)
+                self._futures_vwap[fut] = {"pos": float(new_pos), "cost_basis": new_cost}
+            else:
+                current_pos += trade_vol
+                self._futures_vwap[fut]["pos"] = float(current_pos)
+                if current_pos == 0:
+                    self._futures_vwap[fut]["cost_basis"] = 0.0
+        elif side == "ask":
+            if current_pos <= 0:
+                abs_pos = abs(current_pos)
+                new_pos = current_pos - trade_vol
+                new_cost = (
+                    (abs_pos * current_cost) + (trade_vol * trade_price)
+                ) / max(abs_pos + trade_vol, 1)
+                self._futures_vwap[fut] = {"pos": float(new_pos), "cost_basis": new_cost}
+            else:
+                current_pos -= trade_vol
+                self._futures_vwap[fut]["pos"] = float(current_pos)
+                if current_pos == 0:
+                    self._futures_vwap[fut]["cost_basis"] = 0.0
+
+    def _futures_tick(self, exchange: Any, books: Dict[str, Any]) -> None:
+        try:
+            mids: Dict[str, float] = {}
+            for stock in type(self).INDEX_WEIGHTS:
+                bk = books.get(stock)
+                if bk is None:
+                    try:
+                        bk = exchange.get_last_price_book(stock)
+                    except Exception:
+                        bk = None
+                if bk and bk.bids and bk.asks:
+                    mids[stock] = (bk.bids[0].price + bk.asks[0].price) / 2.0
+
+            if len(mids) != len(type(self).INDEX_WEIGHTS):
+                return
+
+            x_t = sum(type(self).INDEX_WEIGHTS[s] * mids[s] for s in type(self).INDEX_WEIGHTS) / 1000.0
+            raw_pos = exchange.get_positions()
+            pos_by_inst: Dict[str, int] = dict(raw_pos) if raw_pos is not None else {}
+            rf = float(type(self).FUTURES_RISK_FREE_RATE)
+            max_pos = int(type(self).FUTURES_MAX_POS)
+
+            for fut, tau in type(self).FUTURES_TAU.items():
+                bk_f = books.get(fut)
+                if bk_f is None:
+                    try:
+                        bk_f = exchange.get_last_price_book(fut)
+                    except Exception:
+                        bk_f = None
+                if not (bk_f and bk_f.bids and bk_f.asks):
+                    continue
+
+                fut_fair = x_t * math.exp(rf * tau)
+                fut_bid = float(bk_f.bids[0].price)
+                fut_ask = float(bk_f.asks[0].price)
+                pos_f = int(pos_by_inst.get(fut, 0))
+
+                if pos_f == 0:
+                    self._futures_vwap[fut] = {"pos": 0.0, "cost_basis": 0.0}
+
+                buy_edge = fut_fair - fut_ask
+                sell_edge = fut_bid - fut_fair
+
+                if buy_edge >= 0.15 and pos_f < max_pos and self._futures_actions_can(1):
+                    target_vol = self._futures_dynamic_volume(buy_edge)
+                    trade_vol = min(
+                        target_vol,
+                        int(bk_f.asks[0].volume),
+                        max_pos - pos_f,
+                    )
+                    if trade_vol > 0:
+                        exchange.insert_order(
+                            fut,
+                            price=fut_ask,
+                            volume=trade_vol,
+                            side="bid",
+                            order_type="ioc",
+                        )
+                        self._futures_update_vwap(fut, trade_vol, fut_ask, "bid")
+                        self._futures_actions_record(1)
+                        print(
+                            f"  [{fut}] TRUE BUY  | Edge=+${buy_edge:.2f} | Vol={trade_vol} | "
+                            f"Fair={fut_fair:.2f} | Ask={fut_ask}"
+                        )
+
+                elif sell_edge >= 0.15 and pos_f > -max_pos and self._futures_actions_can(1):
+                    target_vol = self._futures_dynamic_volume(sell_edge)
+                    trade_vol = min(
+                        target_vol,
+                        int(bk_f.bids[0].volume),
+                        max_pos + pos_f,
+                    )
+                    if trade_vol > 0:
+                        exchange.insert_order(
+                            fut,
+                            price=fut_bid,
+                            volume=trade_vol,
+                            side="ask",
+                            order_type="ioc",
+                        )
+                        self._futures_update_vwap(fut, trade_vol, fut_bid, "ask")
+                        self._futures_actions_record(1)
+                        print(
+                            f"  [{fut}] TRUE SELL | Edge=+${sell_edge:.2f} | Vol={trade_vol} | "
+                            f"Fair={fut_fair:.2f} | Bid={fut_bid}"
+                        )
+
+                elif pos_f != 0 and self._futures_actions_can(1):
+                    avg_cost = float(self._futures_vwap[fut]["cost_basis"])
+                    if avg_cost == 0.0:
+                        continue
+
+                    if pos_f > 0 and fut_bid >= avg_cost + 0.10:
+                        exit_vol = min(pos_f, int(bk_f.bids[0].volume), 15)
+                        if exit_vol > 0:
+                            exchange.insert_order(
+                                fut,
+                                price=fut_bid,
+                                volume=exit_vol,
+                                side="ask",
+                                order_type="ioc",
+                            )
+                            self._futures_update_vwap(fut, exit_vol, fut_bid, "ask")
+                            self._futures_actions_record(1)
+                            print(
+                                f"  [{fut}] LOCKED PROFIT! Bought @ {avg_cost:.2f}, Sold @ {fut_bid:.2f}"
+                            )
+
+                    elif pos_f < 0 and fut_ask <= avg_cost - 0.10:
+                        exit_vol = min(abs(pos_f), int(bk_f.asks[0].volume), 15)
+                        if exit_vol > 0:
+                            exchange.insert_order(
+                                fut,
+                                price=fut_ask,
+                                volume=exit_vol,
+                                side="bid",
+                                order_type="ioc",
+                            )
+                            self._futures_update_vwap(fut, exit_vol, fut_ask, "bid")
+                            self._futures_actions_record(1)
+                            print(
+                                f"  [{fut}] LOCKED PROFIT! Shorted @ {avg_cost:.2f}, Covered @ {fut_ask:.2f}"
+                            )
+
+        except Exception as e:  # pragma: no cover
+            print(f"  [FUTURES ERR] {e}")
+
     def _bootstrap(self, exchange: Any) -> None:
         print("=" * 60)
-        print("  Dual-listing limit quoter (DUAL around MAIN mid)")
+        print("  Dual-listing DUAL quoter + index/futures IOC edge")
         print("=" * 60)
         self._start_time = time.time()
         self._last_status = 0.0
@@ -659,8 +864,13 @@ class Trader:
         self._pair_states.clear()
         self._last_quote_cycle_ts = float("-inf")
         self._pending_cancels.clear()
+        self._futures_vwap = {f: {"pos": 0.0, "cost_basis": 0.0} for f in type(self).FUTURES_TAU}
+        self._futures_action_ts.clear()
 
-        self._all_assets = sorted({s for pair in self.DUAL_PAIRS for s in pair})
+        dual_syms = {s for pair in self.DUAL_PAIRS for s in pair}
+        index_syms = set(type(self).INDEX_WEIGHTS.keys())
+        fut_syms = set(type(self).FUTURES_TAU.keys())
+        self._all_assets = sorted(dual_syms | index_syms | fut_syms)
         instruments = exchange.get_instruments()
         self._instrument_meta = {
             aid: self._resolve_instrument(instruments, aid) for aid in self._all_assets
@@ -671,7 +881,8 @@ class Trader:
         print(
             f"  Instruments: {self._all_assets}  "
             f"quote_diff={self._quote_diff}  increment={self._quote_increment}  "
-            f"stale_ticks={self._cancel_after_market_trades}  vol={self._quote_volume}"
+            f"stale_ticks={self._cancel_after_market_trades}  vol={self._quote_volume}  "
+            f"futures_max_pos={self.FUTURES_MAX_POS}  futures_actions/s<={self.MAX_FUTURES_ACTIONS_PER_SEC}"
         )
 
         if self._csv_warm_start:
@@ -832,6 +1043,8 @@ class Trader:
         if now - self._last_quote_cycle_ts >= self.MIN_QUOTE_REFRESH_INTERVAL_SEC:
             self._last_quote_cycle_ts = now
             self._run_quote_cycle(exchange, books, virt_pos)
+
+        self._futures_tick(exchange, books)
 
         self.poll_tick_history(exchange, now, books)
 
