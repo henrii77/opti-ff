@@ -10,8 +10,10 @@ anchored to the **MAIN** mid (e.g. NVDA_DUAL bid/ask around NVDA).
   the dual with **no** fill are cancelled.
 
 Live loop: :meth:`Trader.run` (blocking). For a single tick: :meth:`Trader.step`
-(throttled to :data:`Trader.MAX_STEP_CALLS_PER_SEC` / s; exchange inserts / cancels / amends are capped
-by :data:`Trader.MAX_EXCHANGE_OPS_PER_SEC` / s via :meth:`Trader.can_trade`).
+(throttled to :data:`Trader.MAX_STEP_CALLS_PER_SEC` / s). At most one full dual-quote **cycle** per
+:data:`Trader.MIN_QUOTE_REFRESH_INTERVAL_SEC`: **insert** new limits first, then **cancel** superseded
+or stale rests. Inserts are capped at :data:`Trader.MAX_INSERTS_PER_SEC` / s (:meth:`Trader.can_insert`);
+cancels do not count toward that insert budget.
 
 Offline replay helper: :meth:`Trader.replay_dual_listing` (rolling z on spread; unchanged API).
 """
@@ -78,9 +80,11 @@ class Trader:
     TICK_SIZE = 0.10
     MAX_POSITION = 99
     SAFE_POSITION = 80
-    # Inserts, cancels, and amends (trailing 1s window via can_trade / log_actions).
-    MAX_EXCHANGE_OPS_PER_SEC = 25
-    RATE_LIMIT = MAX_EXCHANGE_OPS_PER_SEC
+    # insert_order only (trailing 1s window via can_insert / log_insert).
+    MAX_INSERTS_PER_SEC = 24
+    RATE_LIMIT = MAX_INSERTS_PER_SEC
+    # Minimum wall-clock spacing between full quote cycles (place all, then cancel all).
+    MIN_QUOTE_REFRESH_INTERVAL_SEC = 1.0
     # Main-loop / notebook :meth:`step` call rate (wall-clock).
     MAX_STEP_CALLS_PER_SEC = 25
     DEFAULT_QUOTE_VOLUME = 10
@@ -108,9 +112,11 @@ class Trader:
         self._csv_dir = Path(csv_dir) if csv_dir is not None else self.default_csv_dir()
         self._csv_warm_start = bool(csv_warm_start)
 
-        self._action_ts: Deque[float] = deque()
+        self._insert_ts: Deque[float] = deque()
         self._start_time = 0.0
         self._last_status = 0.0
+        self._last_quote_cycle_ts: float = float("-inf")
+        self._pending_cancels: List[Tuple[str, Any]] = []
         self._all_assets: List[str] = []
         self._instrument_meta: Dict[str, Any] = {}
         self._tick_frames: Dict[str, pd.DataFrame] = {}
@@ -137,17 +143,23 @@ class Trader:
     def round_tick(price: float) -> float:
         return round(round(price / Trader.TICK_SIZE) * Trader.TICK_SIZE, 10)
 
-    def can_trade(self, n: int = 1) -> bool:
-        """Whether ``n`` more exchange ops (insert / cancel / amend) fit in the trailing 1s window."""
+    def can_insert(self, n: int = 1) -> bool:
+        """Whether ``n`` more ``insert_order`` calls fit in the trailing 1s window."""
         now = time.time()
-        while self._action_ts and now - self._action_ts[0] > 1.0:
-            self._action_ts.popleft()
-        return (len(self._action_ts) + n) <= self.RATE_LIMIT
+        while self._insert_ts and now - self._insert_ts[0] > 1.0:
+            self._insert_ts.popleft()
+        return (len(self._insert_ts) + n) <= self.MAX_INSERTS_PER_SEC
 
-    def log_actions(self, n: int = 1) -> None:
+    def log_insert(self, n: int = 1) -> None:
         now = time.time()
         for _ in range(n):
-            self._action_ts.append(now)
+            self._insert_ts.append(now)
+
+    def can_trade(self, n: int = 1) -> bool:
+        return self.can_insert(n)
+
+    def log_actions(self, n: int = 1) -> None:
+        self.log_insert(n)
 
     @staticmethod
     def safe_vol(
@@ -312,7 +324,6 @@ class Trader:
             return
         try:
             exchange.delete_order(dual, order_id=order_id)
-            self.log_actions(1)
         except Exception:
             pass
 
@@ -354,8 +365,6 @@ class Trader:
             return
         if rem < side.initial_volume:
             return
-        if not self.can_trade(1):
-            return
         self._cancel_order_safe(exchange, dual, side.order_id)
         side.order_id = None
         side.initial_volume = 0
@@ -367,7 +376,7 @@ class Trader:
             f"cancel after {self._cancel_after_market_trades} mkt ticks w/o fill"
         )
 
-    def _ensure_limit(
+    def _ensure_limit_place(
         self,
         exchange: Any,
         dual: str,
@@ -380,18 +389,11 @@ class Trader:
     ) -> None:
         vol_req = self.safe_vol(pos_d, self._quote_volume, "bid" if side == "bid" else "ask")
         if vol_req <= 0:
-            if st_side.order_id is not None and self.can_trade(1):
-                self._cancel_order_safe(exchange, dual, st_side.order_id)
-                st_side.order_id = None
-                st_side.placed_trade_seq = -1
-            st_side.pending_target_px = None
-            st_side.pending_until_loop = -1
             return
 
         target_px = self.round_tick(target_px)
         eps = self.TICK_SIZE * 0.5 + 1e-9
 
-        # Same-target insert may not appear in outstanding immediately; wait a few loops.
         if (
             st_side.pending_target_px is not None
             and st_side.pending_until_loop >= 0
@@ -423,7 +425,6 @@ class Trader:
             st_side.pending_until_loop = -1
             return
 
-        # Tracked order still at target but _find_resting_at missed (side repr quirks) — keep.
         if st_side.order_id is not None:
             rem = self._volume_for_order_id(exchange, dual, st_side.order_id)
             px_known = self._price_for_order_id(exchange, dual, st_side.order_id)
@@ -436,13 +437,53 @@ class Trader:
                     st_side.pending_target_px = None
                     st_side.pending_until_loop = -1
                     return
-            if rem is not None and rem > 0 and self.can_trade(1):
-                if px_known is None or abs(self.round_tick(px_known) - target_px) > eps:
-                    self._cancel_order_safe(exchange, dual, st_side.order_id)
+            if rem is not None and rem > 0:
+                old_oid = st_side.order_id
+                if not self.can_insert(1):
+                    return
+                try:
+                    r = exchange.insert_order(
+                        dual,
+                        price=target_px,
+                        volume=vol_req,
+                        side=side,
+                        order_type="limit",
+                    )
+                except Exception as e:  # pragma: no cover
+                    print(f"  [DUAL MM ERR] {dual} {side} insert (replace): {e}")
+                    return
+                if getattr(r, "success", None) is False:
+                    return
+                self.log_insert(1)
+                self._pending_cancels.append((dual, old_oid))
+                oid = self._order_id_from_insert(r)
+                if oid is None:
+                    time.sleep(0.02)
+                    hit2 = self._find_resting_at(exchange, dual, side, target_px, eps)
+                    if hit2 is not None:
+                        oid, rem2, _ = hit2
+                        st_side.initial_volume = rem2
+                        st_side.pending_target_px = None
+                        st_side.pending_until_loop = -1
+                    else:
+                        st_side.initial_volume = vol_req
+                        st_side.pending_target_px = float(target_px)
+                        st_side.pending_until_loop = self._loop_count + 5
+                else:
+                    st_side.initial_volume = vol_req
+                    st_side.pending_target_px = None
+                    st_side.pending_until_loop = -1
+                st_side.order_id = oid
+                st_side.placed_trade_seq = st.market_trade_seq
+                print(
+                    f"  [DUAL MM {side_name.upper()}] {dual}  px={target_px:.2f}  v={vol_req}  "
+                    f"oid={oid}  ref_seq={st.market_trade_seq}  (insert-before-cancel)"
+                )
+                return
             st_side.order_id = None
             st_side.placed_trade_seq = -1
 
-        if not self.can_trade(1):
+        if not self.can_insert(1):
             return
         try:
             r = exchange.insert_order(
@@ -457,7 +498,7 @@ class Trader:
             return
         if getattr(r, "success", None) is False:
             return
-        self.log_actions(1)
+        self.log_insert(1)
         oid = self._order_id_from_insert(r)
         if oid is None:
             time.sleep(0.02)
@@ -482,23 +523,64 @@ class Trader:
             f"oid={oid}  ref_seq={st.market_trade_seq}"
         )
 
-    def _process_pair(
+    def _ensure_limit_cancel(
+        self,
+        exchange: Any,
+        dual: str,
+        pos_d: int,
+        side_name: str,
+        side: str,
+        target_px: float,
+        st_side: _RestingSide,
+        st: _DualQuoteState,
+    ) -> None:
+        vol_req = self.safe_vol(pos_d, self._quote_volume, "bid" if side == "bid" else "ask")
+        target_px = self.round_tick(target_px)
+        eps = self.TICK_SIZE * 0.5 + 1e-9
+
+        if vol_req <= 0:
+            if st_side.order_id is not None:
+                self._cancel_order_safe(exchange, dual, st_side.order_id)
+                st_side.order_id = None
+                st_side.placed_trade_seq = -1
+            st_side.pending_target_px = None
+            st_side.pending_until_loop = -1
+            return
+
+        if st_side.order_id is None:
+            return
+        rem = self._volume_for_order_id(exchange, dual, st_side.order_id)
+        px_known = self._price_for_order_id(exchange, dual, st_side.order_id)
+        if rem is None or px_known is None:
+            return
+        if rem <= 0:
+            self._cancel_order_safe(exchange, dual, st_side.order_id)
+            st_side.order_id = None
+            st_side.placed_trade_seq = -1
+            st_side.pending_target_px = None
+            st_side.pending_until_loop = -1
+            return
+        if abs(self.round_tick(px_known) - target_px) <= eps:
+            return
+        self._cancel_order_safe(exchange, dual, st_side.order_id)
+        st_side.order_id = None
+        st_side.placed_trade_seq = -1
+        st_side.pending_target_px = None
+        st_side.pending_until_loop = -1
+
+    def _pair_poll_trades(
         self,
         exchange: Any,
         main: str,
         dual: str,
         books: Dict[str, Any],
-        virt_pos: Dict[str, int],
     ) -> None:
         bk_m = books.get(main)
         bk_d = books.get(dual)
         if not (bk_m and bk_d and bk_m.bids and bk_m.asks and bk_d.bids and bk_d.asks):
             return
-
-        mm = self.mid(bk_m)
-        if mm is None:
+        if self.mid(bk_m) is None:
             return
-
         st = self._state_for(main, dual)
         n_ticks = self._poll_trade_tick_len(exchange, dual)
         st.market_trade_seq += n_ticks
@@ -514,22 +596,58 @@ class Trader:
             st.lift_steps += 1
             print(f"  [DUAL MM LIFT] {dual}  lift_steps={st.lift_steps}")
 
+    def _pair_quote_targets(
+        self,
+        main: str,
+        dual: str,
+        books: Dict[str, Any],
+        virt_pos: Dict[str, int],
+    ) -> Optional[Tuple[_DualQuoteState, float, float, int]]:
+        bk_m = books.get(main)
+        bk_d = books.get(dual)
+        if not (bk_m and bk_d and bk_m.bids and bk_m.asks and bk_d.bids and bk_d.asks):
+            return None
+        mm = self.mid(bk_m)
+        if mm is None:
+            return None
+        st = self._state_for(main, dual)
         bid_px, ask_px = self._intended_dual_prices(mm, st)
         pos_d = virt_pos.get(dual, 0)
+        return st, bid_px, ask_px, pos_d
 
-        self._maybe_cancel_stale_resting(exchange, dual, st, st.bid, "bid")
-        self._maybe_cancel_stale_resting(exchange, dual, st, st.ask, "ask")
+    def _run_quote_cycle(self, exchange: Any, books: Dict[str, Any], virt_pos: Dict[str, int]) -> None:
+        snaps: List[Tuple[str, str, _DualQuoteState, float, float, int]] = []
+        for main, dual in self.DUAL_PAIRS:
+            row = self._pair_quote_targets(main, dual, books, virt_pos)
+            if row is None:
+                continue
+            st, bid_px, ask_px, pos_d = row
+            snaps.append((main, dual, st, bid_px, ask_px, pos_d))
 
-        self._ensure_limit(exchange, dual, pos_d, "bid", "bid", bid_px, st.bid, st)
-        pos_d = virt_pos.get(dual, 0)
-        self._ensure_limit(exchange, dual, pos_d, "ask", "ask", ask_px, st.ask, st)
+        for _main, dual, st, bid_px, ask_px, pos_d in snaps:
+            self._ensure_limit_place(exchange, dual, pos_d, "bid", "bid", bid_px, st.bid, st)
+            pos_d2 = virt_pos.get(dual, 0)
+            self._ensure_limit_place(exchange, dual, pos_d2, "ask", "ask", ask_px, st.ask, st)
 
-        if st.ask.order_id is not None:
-            st.prev_ask_outstanding_vol = self._volume_for_order_id(
-                exchange, dual, st.ask.order_id
-            )
-        else:
-            st.prev_ask_outstanding_vol = None
+        for dual, oid in list(self._pending_cancels):
+            self._cancel_order_safe(exchange, dual, oid)
+        self._pending_cancels.clear()
+
+        for _main, dual, st, bid_px, ask_px, pos_d in snaps:
+            self._maybe_cancel_stale_resting(exchange, dual, st, st.bid, "bid")
+            self._maybe_cancel_stale_resting(exchange, dual, st, st.ask, "ask")
+            pd = virt_pos.get(dual, 0)
+            self._ensure_limit_cancel(exchange, dual, pd, "bid", "bid", bid_px, st.bid, st)
+            pd = virt_pos.get(dual, 0)
+            self._ensure_limit_cancel(exchange, dual, pd, "ask", "ask", ask_px, st.ask, st)
+
+        for _main, dual, st, _bid_px, _ask_px, _pos_d in snaps:
+            if st.ask.order_id is not None:
+                st.prev_ask_outstanding_vol = self._volume_for_order_id(
+                    exchange, dual, st.ask.order_id
+                )
+            else:
+                st.prev_ask_outstanding_vol = None
 
     def _bootstrap(self, exchange: Any) -> None:
         print("=" * 60)
@@ -539,6 +657,8 @@ class Trader:
         self._last_status = 0.0
         self._loop_count = 0
         self._pair_states.clear()
+        self._last_quote_cycle_ts = float("-inf")
+        self._pending_cancels.clear()
 
         self._all_assets = sorted({s for pair in self.DUAL_PAIRS for s in pair})
         instruments = exchange.get_instruments()
@@ -672,14 +792,20 @@ class Trader:
         if now - self._last_status > 15:
             try:
                 pnl = exchange.get_pnl()
-                rps = len(self._action_ts)
-                print(f"\n[{elapsed:6.0f}s] PnL={pnl:,.2f}  RPS={rps}  Pos={dict(positions)}")
+                while self._insert_ts and now - self._insert_ts[0] > 1.0:
+                    self._insert_ts.popleft()
+                rps = len(self._insert_ts)
+                print(f"\n[{elapsed:6.0f}s] PnL={pnl:,.2f}  inserts_1s={rps}  Pos={dict(positions)}")
             except Exception:
                 pass
             self._last_status = now
 
         for main, dual in self.DUAL_PAIRS:
-            self._process_pair(exchange, main, dual, books, virt_pos)
+            self._pair_poll_trades(exchange, main, dual, books)
+
+        if now - self._last_quote_cycle_ts >= self.MIN_QUOTE_REFRESH_INTERVAL_SEC:
+            self._last_quote_cycle_ts = now
+            self._run_quote_cycle(exchange, books, virt_pos)
 
         self.poll_tick_history(exchange, now, books)
 
