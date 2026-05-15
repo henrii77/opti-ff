@@ -96,18 +96,18 @@ class Trader:
     }
     FUTURES_RISK_FREE_RATE = 0.03
     FUTURES_MAX_POS = 85
-    MAX_FUTURES_ACTIONS_PER_SEC = 21
+    MAX_FUTURES_ACTIONS_PER_SEC = 10
 
     TICK_SIZE = 0.10
     MAX_POSITION = 99
     SAFE_POSITION = 80
     # insert_order only (trailing 1s window via can_insert / log_insert).
-    MAX_INSERTS_PER_SEC = 24
+    MAX_INSERTS_PER_SEC = 12
     RATE_LIMIT = MAX_INSERTS_PER_SEC
     # Minimum wall-clock spacing between full quote cycles (place all, then cancel all).
-    MIN_QUOTE_REFRESH_INTERVAL_SEC = 1.0
+    MIN_QUOTE_REFRESH_INTERVAL_SEC = 2.0
     # Main-loop / notebook :meth:`step` call rate (wall-clock).
-    MAX_STEP_CALLS_PER_SEC = 25
+    MAX_STEP_CALLS_PER_SEC = 8
     DEFAULT_QUOTE_VOLUME = 10
 
     TICK_HISTORY_MAX_ROWS = 10_000
