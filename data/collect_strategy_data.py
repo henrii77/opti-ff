@@ -150,15 +150,24 @@ def snapshot_row_with_book(
     inst: Optional[Any],
     exchange: Exchange,
     book: Any,
+    *,
+    include_last_trade: bool = True,
 ) -> List[Any]:
-    """Same row shape as :func:`snapshot_row`, but uses a pre-fetched price book."""
+    """Same row shape as :func:`snapshot_row`, but uses a pre-fetched price book.
+
+    When ``include_last_trade`` is False, ``last_trade_price`` is left blank and
+    :meth:`Exchange.get_trade_tick_history` is not called (saves an API round-trip per row).
+    """
     if inst is not None:
         type_name, group_s, idx_s = _meta_for_instrument(inst)
     else:
         type_name, group_s, idx_s = "", "", ""
 
-    ticks = exchange.get_trade_tick_history(instrument_id)
-    last_trade = ticks[-1].price if ticks else None
+    if include_last_trade:
+        ticks = exchange.get_trade_tick_history(instrument_id)
+        last_trade = ticks[-1].price if ticks else None
+    else:
+        last_trade = None
 
     bid_price = book.bids[0].price if book.bids else None
     bid_volume = book.bids[0].volume if book.bids else None

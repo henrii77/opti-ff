@@ -12,6 +12,10 @@ Dual-listing market making on **DUAL** (resting limits vs **MAIN** mid) plus opt
 Futures: weighted index mid vs fair ``X_t * exp(r * tau)`` per OB5X contract; IOC entries and
 profit-locked exits use :data:`Trader.MAX_FUTURES_ACTIONS_PER_SEC` (separate from dual insert cap).
 
+CSV: optional append of strategy snapshot rows under :meth:`Trader.default_csv_dir`, rate-limited by
+:data:`Trader.MIN_CSV_BATCH_INTERVAL_SEC` and :data:`Trader.MAX_CSV_WRITES_PER_SEC` (in-memory ticks
+skip per-row trade-tick API calls via ``include_last_trade=False``).
+
 Live loop: :meth:`Trader.run` (blocking). For a single tick: :meth:`Trader.step`
 (throttled to :data:`Trader.MAX_STEP_CALLS_PER_SEC` / s). At most one full dual-quote **cycle** per
 :data:`Trader.MIN_QUOTE_REFRESH_INTERVAL_SEC`: **insert** new limits first, then **cancel** superseded
@@ -33,9 +37,12 @@ from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
+import csv
+
 from data.collect_strategy_data import (
     HEADER,
     OUTPUT_FILENAME_TEMPLATE,
+    ensure_header,
     instrument_csv_path,
     snapshot_row_with_book,
 )
@@ -111,6 +118,9 @@ class Trader:
     DEFAULT_QUOTE_VOLUME = 10
 
     TICK_HISTORY_MAX_ROWS = 10_000
+    # Disk + exchange trade-tick history: at most one full CSV batch per interval; sliding cap on row appends.
+    MIN_CSV_BATCH_INTERVAL_SEC = 2.5
+    MAX_CSV_WRITES_PER_SEC = 16
 
     @staticmethod
     def default_csv_dir() -> Path:
@@ -125,6 +135,7 @@ class Trader:
         quote_volume: int = 10,
         csv_dir: Optional[Union[str, Path]] = None,
         csv_warm_start: bool = False,
+        csv_persist: bool = True,
     ) -> None:
         self._quote_diff = float(quote_diff)
         self._quote_increment = float(quote_increment)
@@ -132,6 +143,7 @@ class Trader:
         self._quote_volume = int(quote_volume)
         self._csv_dir = Path(csv_dir) if csv_dir is not None else self.default_csv_dir()
         self._csv_warm_start = bool(csv_warm_start)
+        self._csv_persist = bool(csv_persist)
 
         self._insert_ts: Deque[float] = deque()
         self._start_time = 0.0
@@ -148,6 +160,8 @@ class Trader:
             f: {"pos": 0, "cost_basis": 0.0} for f in type(self).FUTURES_TAU
         }
         self._futures_action_ts: Deque[float] = deque()
+        self._last_csv_batch_ts: float = float("-inf")
+        self._csv_write_ts: Deque[float] = deque()
 
     def _throttle_step_rate(self) -> None:
         period = 1.0 / float(type(self).MAX_STEP_CALLS_PER_SEC)
@@ -185,6 +199,18 @@ class Trader:
 
     def log_actions(self, n: int = 1) -> None:
         self.log_insert(n)
+
+    def _csv_writes_can(self, n: int = 1) -> bool:
+        now = time.time()
+        lim = int(type(self).MAX_CSV_WRITES_PER_SEC)
+        while self._csv_write_ts and now - self._csv_write_ts[0] > 1.0:
+            self._csv_write_ts.popleft()
+        return len(self._csv_write_ts) + n <= lim
+
+    def _csv_writes_record(self, n: int = 1) -> None:
+        now = time.time()
+        for _ in range(n):
+            self._csv_write_ts.append(now)
 
     @staticmethod
     def safe_vol(
@@ -866,6 +892,8 @@ class Trader:
         self._pending_cancels.clear()
         self._futures_vwap = {f: {"pos": 0.0, "cost_basis": 0.0} for f in type(self).FUTURES_TAU}
         self._futures_action_ts.clear()
+        self._last_csv_batch_ts = float("-inf")
+        self._csv_write_ts.clear()
 
         dual_syms = {s for pair in self.DUAL_PAIRS for s in pair}
         index_syms = set(type(self).INDEX_WEIGHTS.keys())
@@ -882,7 +910,9 @@ class Trader:
             f"  Instruments: {self._all_assets}  "
             f"quote_diff={self._quote_diff}  increment={self._quote_increment}  "
             f"stale_ticks={self._cancel_after_market_trades}  vol={self._quote_volume}  "
-            f"futures_max_pos={self.FUTURES_MAX_POS}  futures_actions/s<={self.MAX_FUTURES_ACTIONS_PER_SEC}"
+            f"futures_max_pos={self.FUTURES_MAX_POS}  futures_actions/s<={self.MAX_FUTURES_ACTIONS_PER_SEC}  "
+            f"csv_persist={self._csv_persist}  csv_batch>={self.MIN_CSV_BATCH_INTERVAL_SEC}s  "
+            f"csv_writes/s<={self.MAX_CSV_WRITES_PER_SEC}"
         )
 
         if self._csv_warm_start:
@@ -972,13 +1002,14 @@ class Trader:
         increment = kwargs.pop("increment", None)
         cancel_after_market_trades = kwargs.pop("cancel_after_market_trades", None)
         quote_volume = kwargs.pop("quote_volume", None)
+        csv_persist = kwargs.pop("csv_persist", None)
 
         if kwargs:
             bad = ", ".join(sorted(kwargs))
             raise TypeError(
                 f"Trader.run() got unexpected keyword argument(s): {bad}. "
                 "Supported: quote_diff, increment, quote_increment, "
-                "cancel_after_market_trades, quote_volume."
+                "cancel_after_market_trades, quote_volume, csv_persist."
             )
 
         if quote_diff is not None:
@@ -989,6 +1020,8 @@ class Trader:
             self._cancel_after_market_trades = int(cancel_after_market_trades)
         if quote_volume is not None:
             self._quote_volume = int(quote_volume)
+        if csv_persist is not None:
+            self._csv_persist = bool(csv_persist)
         self.start(exchange)
         while True:
             self.step(exchange)
@@ -1047,6 +1080,56 @@ class Trader:
         self._futures_tick(exchange, books)
 
         self.poll_tick_history(exchange, now, books)
+        self._flush_ticks_to_csv(exchange, now, books)
+
+    def _flush_ticks_to_csv(self, exchange: Any, now: float, books: Dict[str, Any]) -> None:
+        if not self._csv_persist:
+            return
+        if not exchange.is_connected():
+            return
+        cls = type(self)
+        if now - self._last_csv_batch_ts < cls.MIN_CSV_BATCH_INTERVAL_SEC:
+            return
+
+        candidates = [i for i in self._all_assets if books.get(i)]
+        if not candidates:
+            return
+        if not self._csv_writes_can(len(candidates)):
+            return
+
+        self._last_csv_batch_ts = now
+        self._csv_dir.mkdir(parents=True, exist_ok=True)
+
+        for inst_id in candidates:
+            if not self._csv_writes_can(1):
+                break
+            inst = self._instrument_meta.get(inst_id)
+            book = books[inst_id]
+            path = instrument_csv_path(inst_id, self._csv_dir, OUTPUT_FILENAME_TEMPLATE)
+            ensure_header(path)
+            try:
+                row = snapshot_row_with_book(
+                    now,
+                    inst_id,
+                    inst,
+                    exchange,
+                    book,
+                    include_last_trade=False,
+                )
+            except AssertionError:
+                if not exchange.is_connected():
+                    return
+                raise
+            except Exception as e:  # pragma: no cover
+                print(f"  [CSV WARN] {inst_id}: skip row: {e}")
+                continue
+            try:
+                with open(path, "a", newline="") as f:
+                    csv.writer(f).writerow(row)
+            except OSError as e:  # pragma: no cover
+                print(f"  [CSV WARN] {inst_id}: write {path}: {e}")
+                continue
+            self._csv_writes_record(1)
 
     def poll_tick_history(self, exchange: Any, ts: float, books: Dict[str, Any]) -> None:
         if not exchange.is_connected():
@@ -1058,7 +1141,9 @@ class Trader:
                 continue
             inst = self._instrument_meta.get(inst_id)
             try:
-                row = snapshot_row_with_book(ts, inst_id, inst, exchange, book)
+                row = snapshot_row_with_book(
+                    ts, inst_id, inst, exchange, book, include_last_trade=False
+                )
             except AssertionError:
                 if not exchange.is_connected():
                     return
